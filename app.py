@@ -307,23 +307,30 @@ def build_plot_frame(chart_plot, response_var, show_components, show_tpu_limitat
     x = chart_plot["x"].to_numpy()
     rows = []
 
+    def _finite_runs(mask):
+        padded = np.concatenate(([False], mask, [False]))
+        changes = np.flatnonzero(padded[1:] != padded[:-1])
+        return zip(changes[0::2], changes[1::2])
+
     def _append(name, values, rate, style, is_default):
         values = np.asarray(values, dtype=float)
         mask = np.isfinite(values)
         if not mask.any():
             return
-        rows.append(
-            pd.DataFrame(
-                {
-                    "x": x[mask],
-                    "value": values[mask],
-                    "curve": name,
-                    "rate": rate,
-                    "line_style": style,
-                    "is_default": 1 if is_default else 0,
-                }
+        for segment_id, (start, end) in enumerate(_finite_runs(mask)):
+            rows.append(
+                pd.DataFrame(
+                    {
+                        "x": x[start:end],
+                        "value": values[start:end],
+                        "curve": name,
+                        "rate": rate,
+                        "line_style": style,
+                        "series_id": f"{name}|{rate}|{style}|{segment_id}",
+                        "is_default": 1 if is_default else 0,
+                    }
+                )
             )
-        )
 
     if not show_components or response_var != "A_net":
         for name in [c for c in chart_plot.columns if c != "x"]:
@@ -1050,7 +1057,7 @@ else:
                                 scale=color_scale,
                             ),
                             strokeDash="line_style:N",
-                            detail="curve:N",
+                            detail="series_id:N",
                             opacity=alt.condition(
                                 alt.datum.is_default,
                                 alt.value(1.0),
