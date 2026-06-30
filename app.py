@@ -509,6 +509,7 @@ def render_education_page():
 
         - the **shape change** of a curve (curvature, asymptote, slope, and whether there is a saturating plateau),
         - the **x-location of the regime switch** between `Ac` and `Aj` control,
+        - remember that `*_min` and `*_max` are the predictor values used to build the x-grid (with the same units as your selected x variable),
         - and how quickly the model moves into low or negative `A_net` at stressful settings.
         """
     )
@@ -669,6 +670,14 @@ with st.sidebar:
                 step=1,
                 key="ci_x_max",
             )
+            if response_var == "A_net" and x_min < 41:
+                st.info(
+                    "Low C_i values are a true regime edge in this formulation: `A_j` can legitimately control `A_net` at the far-left part of the x-axis, so you may see an `Aj-limited A_net` segment there."
+                )
+            else:
+                st.caption(
+                    "For `C_i`, very low values can expose a short `Aj`-limited segment at the left edge; that behavior is expected when plotting a wider low-CO₂ range."
+                )
         elif predictor == "T_leaf":
             x_min = st.slider(
                 "T_leaf min (°C)",
