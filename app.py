@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -10,6 +11,11 @@ try:
 except Exception:
     go = None
     make_subplots = None
+
+try:
+    from scipy.stats import kendalltau
+except Exception:
+    kendalltau = None
 
 DARK2_PALETTE = [
     "#1b9e77",
@@ -23,6 +29,105 @@ DARK2_PALETTE = [
 ]
 DARK_GRID = "#d3d3d3"
 DARK_ZERO = "#4b5563"
+
+
+def _resilience_sim_signature(
+    predictor: str,
+    response_var: str,
+    trajectory_steps: int,
+    diagnostic_window: int,
+    indicator_window: int,
+    enable_lag: bool,
+    enable_drift: bool,
+    forcing_white_noise: bool,
+    resilience_2d_mode: bool,
+    secondary_predictor: str,
+    profile: dict,
+    trajectory_settings: list[dict],
+    fluctuation_scale: float,
+    mean_reversion: float,
+    step_factor: float,
+    seed: int,
+    frame_speed_ms: int,
+    lag_steps_global: int,
+    lag_mode: str,
+    lag_reference: float,
+    lag_sensitivity: float,
+):
+    """Build a stable cache key for resilience simulation state."""
+    trajectory_signature = tuple(
+        (
+            float(settings["mean_value"]),
+            float(settings["drift_start"]),
+            float(settings["drift_end"]),
+            float(settings["lag_steps"]),
+            str(settings.get("lag_mode", "Fixed lag")),
+            float(settings.get("lag_reference", 0.0)),
+            float(settings.get("lag_sensitivity", 1.0)),
+            float(settings.get("secondary_value", 0.0))
+            if np.isfinite(float(settings.get("secondary_value", 0.0)))
+            else -1.0e12,
+        )
+        for settings in trajectory_settings
+    )
+    profile_signature = tuple(
+        (
+            key,
+            float(profile[key]) if isinstance(profile[key], (int, float, np.floating, np.integer)) else int(profile[key]),
+        )
+        for key in (
+            "par",
+            "ci",
+            "tleaf",
+            "vpd",
+            "vcmax25",
+            "jmax25",
+            "tpu",
+            "tpu_enabled",
+            "rd25",
+            "alpha",
+            "theta",
+            "temp_optimum_enabled",
+            "temp_optimum_c",
+            "temp_optimum_width_c",
+            "vpd_half",
+            "vpd_exp",
+            "eavc",
+            "eaj",
+            "eagamma",
+            "eakc",
+            "eako",
+            "eard",
+            "gamma25",
+            "kc25",
+            "ko25",
+            "o2",
+        )
+    )
+
+    return (
+        str(predictor),
+        str(response_var),
+        int(diagnostic_window),
+        int(indicator_window),
+        int(trajectory_steps),
+        int(enable_lag),
+        int(enable_drift),
+        int(bool(forcing_white_noise)),
+        int(bool(resilience_2d_mode)),
+        str(secondary_predictor),
+        float(fluctuation_scale),
+        float(mean_reversion),
+        float(step_factor),
+        int(seed),
+        int(frame_speed_ms),
+        int(lag_steps_global),
+        str(lag_mode),
+        float(lag_reference),
+        float(lag_sensitivity),
+        trajectory_signature,
+        profile_signature,
+    )
 
 st.set_page_config(
     page_title="FvCB playground",
@@ -50,14 +155,20 @@ def get_app_page():
     """Return the selected app page from compact top controls."""
     options = ["Photosynthesis", "Resilience"]
     if hasattr(st, "segmented_control"):
-        return st.segmented_control(
+        return st.sidebar.segmented_control(
             "View",
             options=options,
             default="Photosynthesis",
             key="app_page",
             label_visibility="collapsed",
         )
-    return st.radio("View", options=options, index=0, horizontal=True, key="app_page_legacy")
+    return st.sidebar.radio(
+        "View",
+        options=options,
+        index=0,
+        horizontal=True,
+        key="app_page_legacy",
+    )
 
 
 def _build_centered_chart_container(display_width: float):
@@ -77,6 +188,29 @@ def _build_centered_chart_container(display_width: float):
 
 def _trajectory_colors(count: int):
     return [DARK2_PALETTE[idx % len(DARK2_PALETTE)] for idx in range(count)]
+
+
+def _blend_hex_color_with_white(color: str, white_fraction: float) -> str:
+    """Blend a hex color toward white; white_fraction=0 keeps the original color."""
+    color = str(color).strip()
+    if not color.startswith("#") or len(color) != 7:
+        return color
+    white_fraction = float(np.clip(white_fraction, 0.0, 1.0))
+    red = int(color[1:3], 16)
+    green = int(color[3:5], 16)
+    blue = int(color[5:7], 16)
+    red = int(round(red + (255 - red) * white_fraction))
+    green = int(round(green + (255 - green) * white_fraction))
+    blue = int(round(blue + (255 - blue) * white_fraction))
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _trajectory_time_gradient_color(color: str, segment_index: int, max_segment_index: int) -> str:
+    """Return a light-to-dark color for trajectory segment order."""
+    if max_segment_index <= 0:
+        return color
+    time_fraction = float(segment_index) / float(max_segment_index)
+    return _blend_hex_color_with_white(color, white_fraction=0.72 * (1.0 - time_fraction))
 
 
 def build_environment_trajectories(
@@ -152,12 +286,134 @@ def rolling_window_lag1_autocorrelation(values: np.ndarray, window: int) -> np.n
     return result
 
 
-def apply_first_order_lag(response_values: np.ndarray, lag_steps: int) -> np.ndarray:
-    """Apply a first-order lag to a 1D trajectory with NaN-safe, segment-wise smoothing."""
+def _kendall_tau_p(series_x: np.ndarray, series_y: np.ndarray) -> tuple[float, float]:
+    """Compute Kendall tau and two-sided p-value with scipy when available, else fallback."""
+    x = np.asarray(series_x, dtype=float)
+    y = np.asarray(series_y, dtype=float)
+    if x.ndim != 1 or y.ndim != 1 or x.size == 0 or y.size == 0:
+        return (np.nan, np.nan)
+    if x.size != y.size:
+        n = min(x.size, y.size)
+        x = x[:n]
+        y = y[:n]
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 3:
+        return (np.nan, np.nan)
+    x = x[mask]
+    y = y[mask]
+    if kendalltau is not None:
+        try:
+            result = kendalltau(x, y)
+            return float(result.statistic), float(result.pvalue)
+        except Exception:
+            pass
+
+    n = x.size
+    if n < 3:
+        return (np.nan, np.nan)
+
+    s = 0.0
+    for i in range(n - 1):
+        delta_x = x[i + 1 :] - x[i]
+        delta_y = y[i + 1 :] - y[i]
+        product = delta_x * delta_y
+        s += np.sum(np.sign(product))
+
+    tau = s / (0.5 * n * (n - 1))
+
+    _, tie_counts = np.unique(y, return_counts=True)
+    tie_counts = tie_counts[tie_counts > 1]
+    var_s = n * (n - 1) * (2 * n + 5)
+    if tie_counts.size:
+        var_s -= np.sum(tie_counts * (tie_counts - 1) * (2 * tie_counts + 5))
+    var_s = var_s / 18.0
+    if not np.isfinite(var_s) or var_s <= 0:
+        return float(tau), np.nan
+
+    if s > 0:
+        z = (s - 1.0) / np.sqrt(var_s)
+    elif s < 0:
+        z = (s + 1.0) / np.sqrt(var_s)
+    else:
+        z = 0.0
+
+    p_value = float(2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(z) / math.sqrt(2.0)))))
+    return float(tau), p_value
+
+
+def kendall_mann_trend_results(values: np.ndarray, time_axis: np.ndarray, trajectory_names: list[str] | None = None):
+    """Return per-trajectory (name, tau, p-value) tuples for diagnostics."""
+    values = np.asarray(values, dtype=float)
+    if values.ndim != 2:
+        return []
+    trajectory_count = values.shape[0]
+    default_names = [f"Trajectory {idx + 1}" for idx in range(trajectory_count)]
+    if trajectory_names is None:
+        names = default_names
+    else:
+        names = list(trajectory_names)[:trajectory_count]
+        if len(names) < trajectory_count:
+            names.extend(default_names[len(names) : trajectory_count])
+        names = [str(name).strip() or default_names[idx] for idx, name in enumerate(names)]
+
+    results = []
+    for idx in range(trajectory_count):
+        tau, p_value = _kendall_tau_p(time_axis, values[idx])
+        results.append(
+            {
+                "name": names[idx],
+                "tau": float(tau),
+                "p_value": float(p_value) if np.isfinite(p_value) else np.nan,
+            }
+        )
+    return results
+
+
+def apply_first_order_lag(
+    response_values: np.ndarray,
+    lag_steps: int,
+    predictor_values: np.ndarray | None = None,
+    lag_reference: float | None = None,
+    lag_sensitivity: float = 1.0,
+    use_distance_weight: bool = False,
+) -> np.ndarray:
+    """Apply a first-order lag to a 1D trajectory with optional distance-weighted lag.
+
+    The distance weighting is based on how far predictor values are from a reference point:
+    lag_k(t) = lag_steps * (1 + lag_sensitivity * |x_t - lag_reference| / distance_scale),
+    where distance_scale is the maximum predictor distance to the reference.
+    """
     values = np.asarray(response_values, dtype=float)
     lag_steps = max(int(lag_steps), 0)
-    alpha = 1.0 / (1.0 + lag_steps)
     lagged = values.copy()
+
+    # No lag should be exactly identity.
+    if lag_steps == 0:
+        return lagged
+
+    alpha = 1.0 / (1.0 + lag_steps)
+
+    use_distance_weight = (
+        use_distance_weight
+        and predictor_values is not None
+        and lag_reference is not None
+        and lag_sensitivity > 0
+        and np.isfinite(lag_reference)
+    )
+    predictor_array = np.asarray(predictor_values, dtype=float) if use_distance_weight else None
+    if use_distance_weight and predictor_array.shape != values.shape:
+        use_distance_weight = False
+    if use_distance_weight:
+        finite_predictor = np.isfinite(predictor_array)
+        if not finite_predictor.any():
+            use_distance_weight = False
+        else:
+            predictor_min = float(np.nanmin(predictor_array))
+            predictor_max = float(np.nanmax(predictor_array))
+            reference = float(lag_reference)
+            distance_scale = max(abs(reference - predictor_min), abs(predictor_max - reference))
+            if not np.isfinite(distance_scale) or distance_scale <= 0:
+                use_distance_weight = False
 
     finite_idx = np.flatnonzero(np.isfinite(values))
     if finite_idx.size == 0:
@@ -178,7 +434,13 @@ def apply_first_order_lag(response_values: np.ndarray, lag_steps: int) -> np.nda
     for start, end in segments:
         lagged[start] = values[start]
         for step in range(start + 1, end + 1):
-            lagged[step] = lagged[step - 1] + alpha * (values[step] - lagged[step - 1])
+            if use_distance_weight:
+                distance = abs(float(predictor_array[step]) - float(lag_reference))
+                dynamic_lag = lag_steps * (1.0 + lag_sensitivity * (distance / distance_scale))
+                effective_alpha = 1.0 / (1.0 + dynamic_lag) if dynamic_lag >= 0 else alpha
+            else:
+                effective_alpha = alpha
+            lagged[step] = lagged[step - 1] + effective_alpha * (values[step] - lagged[step - 1])
 
     return lagged
 
@@ -280,6 +542,38 @@ def _default_trajectory_mean(predictor, trajectory_idx):
 
 def _default_trajectory_name(trajectory_idx: int) -> str:
     return {0: "Healthy", 1: "Stressed"}.get(trajectory_idx, f"Trajectory {trajectory_idx + 1}")
+
+
+def _predictor_profile_key(predictor: str) -> str:
+    """Map predictor display keys to profile keys used by FvCB evaluation."""
+    return {
+        "PAR": "par",
+        "C_i": "ci",
+        "T_leaf": "tleaf",
+        "VPD": "vpd",
+    }[_normalize_predictor(predictor)]
+
+
+def _format_resilience_secondary_label(secondary_predictor: str, value: float) -> str:
+    """Format a secondary-condition value for trajectory labels/notes."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(val):
+        return ""
+
+    config = PREDICTOR_CONFIG.get(_normalize_predictor(secondary_predictor))
+    if config is None:
+        return f"{val}"
+    unit = config["unit"]
+    if secondary_predictor == "T_leaf":
+        return f"{val:.1f} °C"
+    if secondary_predictor == "C_i":
+        return f"{val:.0f} {unit}"
+    if secondary_predictor == "VPD":
+        return f"{val:.2f} {unit}"
+    return f"{val:.0f} {unit}"
 
 
 def _response_axis_label(response_var):
@@ -871,7 +1165,25 @@ def reset_all_settings():
         "kc25": 404.9,
         "ko25": 278000.0,
         "o2": 210000.0,
-        "resilience_lag_default_steps": 0,
+        "resilience_lag_steps": 1,
+        "resilience_lag_default_steps": 1,
+        "resilience_lag_mode": "Fixed lag",
+        "resilience_lag_sensitivity": 1.0,
+        "resilience_2d_mode": False,
+        "resilience_2d_mode_initialized": False,
+        "resilience_condition_predictor": "T_leaf",
+        "resilience_forcing_mode": "white",
+        "resilience_fluctuation_scale_pct": 5,
+        "resilience_diagnostic_window": 30,
+        "resilience_indicator_window": 30,
+        "resilience_trajectory_count": 2,
+        "resilience_trajectory_steps": 120,
+        "resilience_frame_speed_ms": 110,
+        "resilience_auto_update": False,
+        "resilience_enable_lag": False,
+        "resilience_enable_drift": False,
+        "resilience_sim_signature": None,
+        "resilience_sim_cached_payload": None,
         "resilience_model_tier": "Basic",
         "resilience_trajectory_name_0": "Healthy",
         "resilience_trajectory_name_1": "Stressed",
@@ -881,10 +1193,14 @@ def reset_all_settings():
         "resilience_trajectory_name_5": "Trajectory 6",
     }
     for trajectory_idx in range(6):
-        defaults[f"resilience_lag_{PREDICTOR_OPTIONS[0]}_{trajectory_idx}"] = 0
-        defaults[f"resilience_lag_{PREDICTOR_OPTIONS[1]}_{trajectory_idx}"] = 0
-        defaults[f"resilience_lag_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = 0
-        defaults[f"resilience_lag_{PREDICTOR_OPTIONS[3]}_{trajectory_idx}"] = 0
+        for predictor_name in PREDICTOR_OPTIONS:
+            defaults[f"resilience_condition_{predictor_name}_{trajectory_idx}"] = _default_trajectory_mean(
+                predictor_name, trajectory_idx
+            )
+        for predictor_name in PREDICTOR_OPTIONS:
+            defaults[f"resilience_lag_reference_{predictor_name}"] = (
+                25.0 if predictor_name == "T_leaf" else float(PREDICTOR_CONFIG[predictor_name]["default"])
+            )
         defaults[f"resilience_mean_{PREDICTOR_OPTIONS[0]}_{trajectory_idx}"] = _default_trajectory_mean(
             PREDICTOR_OPTIONS[0], trajectory_idx
         )
@@ -909,18 +1225,27 @@ def reset_all_settings():
         defaults[f"resilience_drift_end_{PREDICTOR_OPTIONS[1]}_{trajectory_idx}"] = _default_trajectory_mean(
             PREDICTOR_OPTIONS[1], trajectory_idx
         )
-        defaults[f"resilience_drift_start_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = _default_trajectory_mean(
-            PREDICTOR_OPTIONS[2], trajectory_idx
-        )
-        defaults[f"resilience_drift_end_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = _default_trajectory_mean(
-            PREDICTOR_OPTIONS[2], trajectory_idx
-        )
+        if PREDICTOR_OPTIONS[2] == "T_leaf" and trajectory_idx == 0:
+            defaults[f"resilience_drift_start_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = 15.0
+            defaults[f"resilience_drift_end_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = 25.0
+        elif PREDICTOR_OPTIONS[2] == "T_leaf" and trajectory_idx == 1:
+            defaults[f"resilience_drift_start_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = 25.0
+            defaults[f"resilience_drift_end_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = 35.0
+        else:
+            defaults[f"resilience_drift_start_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = _default_trajectory_mean(
+                PREDICTOR_OPTIONS[2], trajectory_idx
+            )
+            defaults[f"resilience_drift_end_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = _default_trajectory_mean(
+                PREDICTOR_OPTIONS[2], trajectory_idx
+            )
         defaults[f"resilience_drift_start_{PREDICTOR_OPTIONS[3]}_{trajectory_idx}"] = _default_trajectory_mean(
             PREDICTOR_OPTIONS[3], trajectory_idx
         )
         defaults[f"resilience_drift_end_{PREDICTOR_OPTIONS[3]}_{trajectory_idx}"] = _default_trajectory_mean(
             PREDICTOR_OPTIONS[3], trajectory_idx
         )
+    defaults["resilience_condition_T_leaf_0"] = 25.0
+    defaults["resilience_condition_T_leaf_1"] = 35.0
     for key, value in defaults.items():
         st.session_state[key] = value
 
@@ -946,6 +1271,7 @@ def build_resilience_animation_figure(
     response_label,
     trajectory_names,
     frame_speed_ms,
+    baseline_curve_names=None,
     chart_height=1120,
 ):
     """Return a dual-panel Plotly animation for resilience trajectories."""
@@ -969,7 +1295,7 @@ def build_resilience_animation_figure(
         )
     time = np.arange(steps)
     template = "plotly_white"
-    neutral_color = DARK_ZERO
+    neutral_color = "black"
     neutral_grid = DARK_GRID
     muted_color = "#6b7280"
     colors = _trajectory_colors(trajectory_count)
@@ -988,28 +1314,67 @@ def build_resilience_animation_figure(
     )
 
     # Top panel: response curve and trajectory positions in predictor-response space.
-    figure.add_trace(
-        go.Scatter(
-            x=baseline_curve_x,
-            y=baseline_curve_response,
-            mode="lines",
-            name="Baseline curve",
-            line=dict(color=muted_color, width=3, dash="dash"),
-            opacity=0.85,
-        ),
-        row=1,
-        col=1,
-    )
+    baseline_response_array = np.asarray(baseline_curve_response) if baseline_curve_response is not None else np.array([])
+    if (
+        isinstance(baseline_curve_response, (list, tuple))
+        or (isinstance(baseline_response_array, np.ndarray) and baseline_response_array.ndim == 2)
+    ):
+        baseline_curves = baseline_curve_response
+        if isinstance(baseline_curves, np.ndarray) and baseline_curves.ndim == 1:
+            baseline_curves = [baseline_curves]
+        baseline_curve_names = (
+            list(baseline_curve_names)
+            if baseline_curve_names is not None
+            else list(trajectory_names)
+        )
+        if len(baseline_curve_names) == 0:
+            baseline_curve_names = [f"Trajectory {idx + 1}" for idx in range(trajectory_count)]
+        while len(baseline_curve_names) < len(baseline_curves):
+            baseline_curve_names.append(f"Trajectory {len(baseline_curve_names) + 1}")
+        for idx, baseline_y in enumerate(baseline_curves):
+            if baseline_y is None:
+                continue
+            baseline_y = np.asarray(baseline_y, dtype=float)
+            if baseline_y.size == 0:
+                continue
+            baseline_color = colors[idx % len(colors)]
+            figure.add_trace(
+                go.Scatter(
+                    x=baseline_curve_x,
+                    y=baseline_y,
+                    mode="lines",
+                    name=f"{baseline_curve_names[idx]} baseline",
+                    line=dict(color=baseline_color, width=2.8, dash="dash"),
+                    opacity=0.85,
+                    showlegend=False,
+                ),
+                row=1,
+                col=1,
+            )
+    elif baseline_curve_response is not None:
+        figure.add_trace(
+                go.Scatter(
+                    x=baseline_curve_x,
+                    y=baseline_curve_response,
+                    mode="lines",
+                    name="Baseline curve",
+                    line=dict(color=muted_color, width=3, dash="dash"),
+                    opacity=0.85,
+                    showlegend=False,
+                ),
+            row=1,
+            col=1,
+        )
 
     figure.add_trace(
-        go.Scatter(
-            x=time,
-            y=environment_anomaly,
-            mode="lines",
-            name=f"Δ{predictor_label} forcing",
-            line=dict(color=neutral_color, width=3.2),
-            showlegend=True,
-        ),
+            go.Scatter(
+                x=time,
+                y=environment_anomaly,
+                mode="lines",
+                name=f"Δ{predictor_label} forcing",
+                line=dict(color="black", width=1.6),
+                showlegend=True,
+            ),
         row=2,
         col=1,
         secondary_y=False,
@@ -1019,44 +1384,54 @@ def build_resilience_animation_figure(
             x=[0],
             y=[environment_anomaly[0]],
             mode="markers",
-            name=f"Current Δ{predictor_label} forcing",
             marker=dict(
-                color=neutral_color,
+                color="white",
                 size=10,
                 symbol="circle",
-                line=dict(color=neutral_color, width=1),
+                line=dict(color="black", width=1),
             ),
-            showlegend=True,
+            showlegend=False,
         ),
         row=2,
         col=1,
         secondary_y=False,
     )
+    environment_marker_index = len(figure.data) - 1
 
+    marker_indexes = []
     for idx in range(trajectory_count):
         color = colors[idx]
         trajectory_name = trajectory_names[idx]
-        figure.add_trace(
-            go.Scatter(
-                x=predictor_values[idx],
-                y=response_values[idx],
-                mode="lines",
-                name=trajectory_name,
-                line=dict(color=color, width=2),
-                showlegend=True,
-            ),
-            row=1,
-            col=1,
-        )
+        max_segment_index = max(steps - 2, 0)
+        for step in range(max(steps - 1, 0)):
+            segment_color = _trajectory_time_gradient_color(color, step, max_segment_index)
+            figure.add_trace(
+                go.Scatter(
+                    x=predictor_values[idx, step : step + 2],
+                    y=response_values[idx, step : step + 2],
+                    mode="lines",
+                    name=trajectory_name,
+                    line=dict(color=segment_color, width=2.2),
+                    legendgroup=trajectory_name,
+                    showlegend=(step == max_segment_index),
+                ),
+                row=1,
+                col=1,
+            )
         marker_trace = go.Scatter(
             x=[predictor_values[idx, 0]],
             y=[response_values[idx, 0]],
             mode="markers",
-            name=f"Current {trajectory_name} state",
-            marker=dict(color=color, size=10, symbol="circle-open"),
-            showlegend=(idx == 0),
+            marker=dict(
+                color="white",
+                size=12,
+                symbol="circle",
+                line=dict(color=color, width=2.5),
+            ),
+            showlegend=False,
         )
         figure.add_trace(marker_trace, row=1, col=1)
+        left_marker_index = len(figure.data) - 1
 
         # Response anomaly line
         figure.add_trace(
@@ -1067,7 +1442,7 @@ def build_resilience_animation_figure(
                 name=f"Δ{response_label} {trajectory_name}",
                 line=dict(color=color, width=2.5),
                 opacity=0.95,
-                showlegend=True,
+                showlegend=False,
             ),
             row=2,
             col=1,
@@ -1077,24 +1452,19 @@ def build_resilience_animation_figure(
             x=[0],
             y=[response_anoms[idx, 0]],
             mode="markers",
-            name=(
-                f"Current {trajectory_name} Δ{response_label}"
+            marker=dict(
+                color="white",
+                size=10,
+                symbol="circle",
+                line=dict(color=color, width=2.2),
             ),
-            marker=dict(color=color, size=9, symbol="circle"),
-            showlegend=(idx == 0),
+            showlegend=False,
         )
         figure.add_trace(anet_anom_marker, row=2, col=1, secondary_y=True)
+        response_marker_index = len(figure.data) - 1
+        marker_indexes.append((left_marker_index, response_marker_index))
 
     # Pre-compute marker trace indexes for stable frame updates.
-    environment_marker_index = 2
-    marker_indexes = []
-    for idx in range(trajectory_count):
-        first_index_for_trajectory = 3 + idx * 4
-        left_marker_index = first_index_for_trajectory + 1
-        response_marker_index = first_index_for_trajectory + 3
-        marker_indexes.append(
-            (left_marker_index, response_marker_index),
-        )
 
     # Build frame traces for the moving points only.
     frames = []
@@ -1105,10 +1475,10 @@ def build_resilience_animation_figure(
                 y=[environment_anomaly[step]],
                 mode="markers",
                 marker=dict(
-                    color=neutral_color,
-                    size=8,
+                    color="white",
+                    size=10,
                     symbol="circle",
-                    line=dict(color=neutral_color, width=1),
+                    line=dict(color=neutral_color, width=1.4),
                 ),
             )
         ]
@@ -1120,7 +1490,12 @@ def build_resilience_animation_figure(
                     x=[predictor_values[idx, step]],
                     y=[response_values[idx, step]],
                     mode="markers",
-                    marker=dict(color=colors[idx], size=10, symbol="circle-open"),
+                    marker=dict(
+                        color="white",
+                        size=12,
+                        symbol="circle",
+                        line=dict(color=colors[idx], width=2.5),
+                    ),
                 )
             )
             frame_trace_indices.append(left_marker_index)
@@ -1129,7 +1504,12 @@ def build_resilience_animation_figure(
                     x=[step],
                     y=[response_anoms[idx, step]],
                     mode="markers",
-                    marker=dict(color=colors[idx], size=8, symbol="circle"),
+                    marker=dict(
+                        color="white",
+                        size=10,
+                        symbol="circle",
+                        line=dict(color=colors[idx], width=2.2),
+                    ),
                 )
             )
             frame_trace_indices.append(response_marker_index)
@@ -1172,7 +1552,7 @@ def build_resilience_animation_figure(
         y_pad = max((y_max - y_min) * 0.06, 0.5)
         left_y_range = [y_min - y_pad, y_max + y_pad]
 
-    figure.update_layout(
+        figure.update_layout(
         height=chart_height,
         template=template,
         paper_bgcolor="#ffffff",
@@ -1181,17 +1561,21 @@ def build_resilience_animation_figure(
         hovermode=False,
         legend=dict(
             orientation="h",
-            y=1.18,
-            x=1,
-            xanchor="right",
-            yanchor="bottom",
+            y=1.19,
+            x=0.0,
+            xanchor="left",
+            yanchor="top",
+            traceorder="normal",
+            itemwidth=175,
+            valign="top",
             title=dict(
                 text="Legend",
                 font=dict(color="black", size=12),
             ),
             font=dict(color="black"),
+            itemsizing="constant",
         ),
-        margin=dict(l=20, r=20, t=230, b=35),
+        margin=dict(l=20, r=30, t=220, b=35),
         updatemenus=[
             {
                 "type": "buttons",
@@ -1307,20 +1691,161 @@ def build_resilience_animation_figure(
         y=0,
         line_color=DARK_ZERO,
         line_dash="dot",
-        line_width=1.6,
+        line_width=1.4,
+        opacity=0.5,
         row=2,
         col=1,
         secondary_y=False,
+        layer="below",
     )
     figure.add_hline(
         y=0,
         line_color=DARK_ZERO,
         line_dash="dot",
-        line_width=1.6,
+        line_width=1.4,
+        opacity=0.5,
         row=2,
         col=1,
         secondary_y=True,
+        layer="below",
     )
+    return figure
+
+
+def build_resilience_setpoint_curve_figure(
+    setpoint_axis,
+    setpoint_curves,
+    trajectory_names,
+    secondary_values,
+    secondary_responses,
+    setpoint_label,
+    response_label,
+    chart_height=460,
+    trajectory_colors=None,
+):
+    """Return a response-vs-setpoint chart for 2D resilience comparisons."""
+    if go is None:
+        return None
+
+    setpoint_axis = np.asarray(setpoint_axis, dtype=float)
+    if setpoint_axis.size == 0:
+        return None
+
+    setpoint_curves = np.asarray(setpoint_curves, dtype=float)
+    if setpoint_curves.ndim != 2:
+        setpoint_curves = np.asarray(setpoint_curves, dtype=float).reshape((1, -1))
+
+    trajectory_count = min(len(trajectory_names), int(setpoint_curves.shape[0]))
+    trajectory_names = [
+        str(trajectory_names[idx]).strip() if str(trajectory_names[idx]).strip() else f"Trajectory {idx + 1}"
+        for idx in range(trajectory_count)
+    ]
+    if trajectory_colors is None:
+        trajectory_colors = _trajectory_colors(trajectory_count)
+    else:
+        trajectory_colors = list(trajectory_colors)
+        if len(trajectory_colors) < trajectory_count:
+            trajectory_colors = _trajectory_colors(trajectory_count)
+
+    figure = go.Figure()
+    for idx in range(trajectory_count):
+        response_curve = np.asarray(setpoint_curves[idx], dtype=float)
+        if response_curve.size == 0 or not np.isfinite(response_curve).any():
+            continue
+
+        response_curve = np.asarray(response_curve, dtype=float)
+        color = trajectory_colors[idx % len(trajectory_colors)]
+        secondary_value = float(secondary_values[idx]) if idx < len(secondary_values) else np.nan
+        secondary_response = float(secondary_responses[idx]) if idx < len(secondary_responses) else np.nan
+
+        figure.add_trace(
+            go.Scatter(
+                x=setpoint_axis,
+                y=response_curve,
+                mode="lines",
+                name=trajectory_names[idx],
+                line=dict(color=color, width=3.0, dash="dash"),
+                opacity=0.88,
+                showlegend=True,
+            )
+        )
+
+        if np.isfinite(secondary_value) and np.isfinite(secondary_response):
+            figure.add_trace(
+                go.Scatter(
+                    x=[secondary_value],
+                    y=[secondary_response],
+                    mode="markers+text",
+                    text=[f"{trajectory_names[idx]}<br>{secondary_value:.1f}"],
+                    textposition="top center",
+                    name=f"{trajectory_names[idx]} setpoint",
+                    marker=dict(color="white", size=10, line=dict(color=color, width=2)),
+                    textfont=dict(color=color, size=12),
+                    showlegend=False,
+                )
+            )
+
+    finite_y = np.concatenate([
+        curve.ravel()[np.isfinite(curve.ravel())]
+        for curve in setpoint_curves[:trajectory_count]
+        if np.asarray(curve).size
+    ], axis=0)
+    finite_y = np.asarray(finite_y, dtype=float)
+    finite_x = np.asarray(setpoint_axis, dtype=float)[np.isfinite(setpoint_axis)]
+
+    x_range = [float(np.min(finite_x)), float(np.max(finite_x))] if finite_x.size else None
+    y_range = None
+    if finite_y.size:
+        y_pad = max(0.06 * (float(np.nanmax(finite_y)) - float(np.nanmin(finite_y))), 0.5)
+        y_range = [float(np.nanmin(finite_y)) - y_pad, float(np.nanmax(finite_y)) + y_pad]
+
+    figure.update_layout(
+        height=chart_height,
+        template="plotly_white",
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="black", size=12),
+        title=f"Setpoint response curves ({setpoint_label})",
+        title_font=dict(color="black", size=14),
+        margin=dict(l=20, r=20, t=55, b=35),
+        legend=dict(
+            orientation="h",
+            x=0.0,
+            y=1.15,
+            xanchor="left",
+            yanchor="top",
+            font=dict(color="black", size=11),
+            itemsizing="constant",
+        ),
+    )
+    figure.update_xaxes(
+        title_text=setpoint_label,
+        range=x_range,
+        showgrid=True,
+        gridcolor=DARK_GRID,
+        title_font=dict(color="black", size=14),
+        tickfont=dict(color="black", size=11),
+        linecolor="#111827",
+        linewidth=1.2,
+    )
+    figure.update_yaxes(
+        title_text=response_label,
+        range=y_range,
+        showgrid=True,
+        gridcolor=DARK_GRID,
+        title_font=dict(color="black", size=14),
+        tickfont=dict(color="black", size=11),
+        linecolor="#111827",
+        linewidth=1.2,
+    )
+    if finite_y.size:
+        figure.add_hline(
+            y=0,
+            line_color=DARK_ZERO,
+            line_dash="dot",
+            line_width=1.3,
+            opacity=0.5,
+        )
     return figure
 
 
@@ -1331,8 +1856,13 @@ def build_resilience_indicator_figure(
     y_title,
     colors,
     trajectory_names=None,
-    y_range=None,
     figure_height=380,
+    show_zero_line=True,
+    show_mean_line=False,
+    trend_stats=None,
+    environment_series=None,
+    environment_trend_stats=None,
+    environment_name="Environmental factor",
 ):
     """Return a compact Plotly line chart for rolling resilience indicators."""
     figure = go.Figure()
@@ -1361,23 +1891,108 @@ def build_resilience_indicator_figure(
             )
         )
 
-    finite_counts = np.isfinite(values).sum(axis=0)
-    sums = np.nansum(values, axis=0)
-    mean_values = np.divide(
-        sums,
-        finite_counts,
-        out=np.full(values.shape[1], np.nan, dtype=float),
-        where=finite_counts > 0,
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=time,
-            y=mean_values,
-            mode="lines",
-            name="Mean",
-            line=dict(color=neutral_color, width=4.5, dash="dash"),
+    if show_mean_line:
+        finite_counts = np.isfinite(values).sum(axis=0)
+        sums = np.nansum(values, axis=0)
+        mean_values = np.divide(
+            sums,
+            finite_counts,
+            out=np.full(values.shape[1], np.nan, dtype=float),
+            where=finite_counts > 0,
         )
-    )
+        figure.add_trace(
+            go.Scatter(
+                x=time,
+                y=mean_values,
+                mode="lines",
+                name="Mean",
+                line=dict(color=neutral_color, width=4.5, dash="dash"),
+                showlegend=False,
+            )
+        )
+
+    if environment_series is not None:
+        env = np.asarray(environment_series, dtype=float).reshape(-1)
+        if env.size > len(time):
+            env = env[: len(time)]
+        elif env.size < len(time):
+            env = np.pad(
+                env,
+                (0, len(time) - env.size),
+                mode="constant",
+                constant_values=np.nan,
+            )
+
+        finite_values = np.isfinite(values)
+        if np.any(finite_values):
+            value_min = float(np.nanmin(values[finite_values]))
+            value_max = float(np.nanmax(values[finite_values]))
+            value_mid = 0.5 * (value_min + value_max)
+            value_half_range = max(1e-12, 0.5 * max(abs(value_max - value_min), 1.0))
+        else:
+            value_mid = 0.0
+            value_half_range = 1.0
+
+        env_mask = np.isfinite(env)
+        if np.any(env_mask):
+            env_min = float(np.nanmin(env[env_mask]))
+            env_max = float(np.nanmax(env[env_mask]))
+            if env_max > env_min:
+                env_norm = (env - env_min) / (env_max - env_min)
+            else:
+                env_norm = np.full_like(env, 0.5)
+            env_scaled = value_mid + value_half_range * (env_norm - 0.5) * 0.9
+            figure.add_trace(
+                go.Scatter(
+                    x=time,
+                    y=env_scaled,
+                    mode="lines",
+                    name=environment_name,
+                    line=dict(color="black", width=1.4),
+                    showlegend=False,
+                )
+            )
+
+    if trend_stats is None:
+        trend_stats = []
+    else:
+        trend_stats = list(trend_stats)
+    if environment_trend_stats:
+        trend_stats.extend(environment_trend_stats)
+
+    if trend_stats:
+        for idx, item in enumerate(trend_stats):
+            name = str(item.get("name", "Trajectory"))
+            tau = item.get("tau", np.nan)
+            p_value = item.get("p_value", np.nan)
+            if np.isfinite(tau) and np.isfinite(p_value):
+                p_decimal = f"{p_value:.2f}"
+                p_scientific = f"{p_value:.2e}"
+                line_text = f"{name}: τ = {tau:.3f}, p = {p_decimal} ({p_scientific})"
+            elif np.isfinite(tau):
+                line_text = f"{name}: τ = {tau:.3f}, p = N/A"
+            else:
+                line_text = f"{name}: τ = N/A, p = N/A"
+            is_significant = np.isfinite(tau) and np.isfinite(p_value) and p_value < 0.05
+            if is_significant:
+                line_text = f"<b>{line_text}</b>"
+            line_color = diagnostic_palette[idx % len(diagnostic_palette)]
+            if idx >= values.shape[0]:
+                line_color = "black"
+            figure.add_annotation(
+                text=line_text,
+                xref="paper",
+                yref="paper",
+                x=0.02,
+                y=0.99 - (0.085 * idx),
+                xanchor="left",
+                yanchor="top",
+                align="left",
+                showarrow=False,
+                font=dict(color=line_color, size=12),
+                borderwidth=0,
+                borderpad=0,
+            )
 
     figure.update_layout(
         title=title,
@@ -1389,10 +2004,10 @@ def build_resilience_indicator_figure(
         hovermode=False,
         margin=dict(l=20, r=20, t=55, b=25),
         legend=dict(
-            orientation="h",
+            orientation="v",
             y=1.08,
-            x=1,
-            xanchor="right",
+            x=1.02,
+            xanchor="left",
             yanchor="bottom",
             title=dict(
                 text="Legend",
@@ -1415,7 +2030,6 @@ def build_resilience_indicator_figure(
     )
     figure.update_yaxes(
         title_text=y_title,
-        range=y_range,
         showgrid=True,
         gridcolor=grid_color,
         title_font=dict(color="black", size=14),
@@ -1423,7 +2037,8 @@ def build_resilience_indicator_figure(
         linecolor="#111827",
         linewidth=1.2,
     )
-    figure.add_hline(y=0, line_color=DARK_ZERO, line_width=1.8)
+    if show_zero_line:
+        figure.add_hline(y=0, line_color=DARK_ZERO, line_width=1.8)
     return figure
 
 
@@ -1560,12 +2175,27 @@ def render_resilience_page():
         st.session_state["resilience_predictor"] = "T_leaf"
     if st.session_state.get("resilience_response_var") not in RESPONSE_OPTIONS:
         st.session_state["resilience_response_var"] = "A_net"
-    resilience_tier_options = ["Basic", "Lag response", "Lag + drift"]
-    if st.session_state.get("resilience_model_tier") not in resilience_tier_options:
-        st.session_state["resilience_model_tier"] = "Basic"
-    resilience_tier = st.session_state.get("resilience_model_tier", "Basic")
-    enable_lag = resilience_tier != "Basic"
-    enable_drift = resilience_tier == "Lag + drift"
+    legacy_tier = st.session_state.get("resilience_model_tier", "Basic")
+    if legacy_tier not in ("Basic", "Lag response", "Lag + drift"):
+        legacy_tier = "Basic"
+    if "resilience_enable_lag" not in st.session_state:
+        st.session_state["resilience_enable_lag"] = legacy_tier != "Basic"
+    if "resilience_enable_drift" not in st.session_state:
+        st.session_state["resilience_enable_drift"] = legacy_tier == "Lag + drift"
+    enable_lag = bool(st.session_state.get("resilience_enable_lag", False))
+    enable_drift = bool(st.session_state.get("resilience_enable_drift", False))
+
+    resilience_2d_mode = bool(st.session_state.get("resilience_2d_mode", False))
+    resilience_condition_predictor = st.session_state.get("resilience_condition_predictor", "T_leaf")
+    if resilience_2d_mode and not st.session_state.get("resilience_2d_mode_initialized", False):
+        st.session_state["resilience_predictor"] = "PAR"
+        resilience_condition_predictor = "T_leaf"
+        st.session_state["resilience_condition_predictor"] = resilience_condition_predictor
+        st.session_state["resilience_condition_T_leaf_0"] = 25.0
+        st.session_state["resilience_condition_T_leaf_1"] = 35.0
+        st.session_state["resilience_2d_mode_initialized"] = True
+
+    resilience_2d_mode = bool(st.session_state.get("resilience_2d_mode", False))
 
     trajectory_count = int(st.session_state.get("resilience_trajectory_count", 2))
     trajectory_steps = int(st.session_state.get("resilience_trajectory_steps", 120))
@@ -1587,27 +2217,85 @@ def render_resilience_page():
         fluctuation_scale = default_mean_value * (fluctuation_scale_pct / 100.0)
     mean_reversion = float(st.session_state.get("resilience_mean_reversion", 0.35))
     step_factor = float(st.session_state.get("resilience_step_factor", 0.55))
+    forcing_mode = str(st.session_state.get("resilience_forcing_mode", "white"))
+    if forcing_mode not in ("white", "mean_reverting"):
+        forcing_mode = "white"
+        st.session_state["resilience_forcing_mode"] = forcing_mode
+    forcing_white_noise = forcing_mode == "white"
     seed = int(st.session_state.get("resilience_seed", 42))
     frame_speed_ms = int(st.session_state.get("resilience_frame_speed_ms", 110))
-    lag_default_steps = int(st.session_state.get("resilience_lag_default_steps", 0))
+    diagnostic_window = int(st.session_state.get("resilience_diagnostic_window", 30))
+    indicator_window = int(st.session_state.get("resilience_indicator_window", diagnostic_window))
+    if trajectory_steps <= 0:
+        trajectory_steps = 120
+        st.session_state["resilience_trajectory_steps"] = trajectory_steps
+    diagnostic_window = max(5, min(diagnostic_window, max(5, trajectory_steps)))
+    indicator_window = max(5, min(indicator_window, max(5, trajectory_steps)))
+    st.session_state["resilience_diagnostic_window"] = diagnostic_window
+    st.session_state["resilience_indicator_window"] = indicator_window
+    
+    def _apply_resilience_preset(
+        disturbance_predictor: str,
+        condition_predictor: str,
+        first_condition: float,
+        second_condition: float,
+    ) -> None:
+        st.session_state["resilience_2d_mode"] = True
+        st.session_state["resilience_predictor"] = disturbance_predictor
+        st.session_state["resilience_condition_predictor"] = condition_predictor
+        st.session_state["resilience_2d_mode_initialized"] = True
+        st.session_state[f"resilience_condition_{condition_predictor}_0"] = float(first_condition)
+        st.session_state[f"resilience_condition_{condition_predictor}_1"] = float(second_condition)
+        if st.session_state.get("resilience_trajectory_count", 2) >= 2:
+            st.session_state["resilience_trajectory_name_0"] = "Healthy"
+            st.session_state["resilience_trajectory_name_1"] = "Stressed"
+
+    def _apply_resilience_1d_preset() -> None:
+        st.session_state["resilience_2d_mode"] = False
+        st.session_state["resilience_2d_mode_initialized"] = False
+        st.session_state["resilience_predictor"] = "T_leaf"
+        st.session_state["resilience_response_var"] = "A_net"
+        if st.session_state.get("resilience_trajectory_count", 2) >= 1:
+            st.session_state["resilience_trajectory_name_0"] = "Healthy"
+        if st.session_state.get("resilience_trajectory_count", 2) >= 2:
+            st.session_state["resilience_trajectory_name_1"] = "Stressed"
+
+    lag_steps_global = int(
+        st.session_state.get(
+            "resilience_lag_steps",
+            st.session_state.get("resilience_lag_default_steps", 1),
+        )
+    )
 
     with st.sidebar:
+        resilience_auto_update = st.session_state.get("resilience_auto_update", False)
+        run_resilience_sim = False
+        if not resilience_auto_update:
+            st.caption("Automatic recalculation is off.")
+            run_resilience_sim = st.button(
+                "Run resilience simulation",
+                key="resilience_run_simulation",
+                use_container_width=True,
+                type="primary",
+                help="Apply current resilience settings and refresh charts.",
+            )
+
         with st.expander("Model description", expanded=False):
             st.markdown(
                 """
 ### Resilience simulation
 
-- Three modeling tiers are available:
-  - **Basic**: shared anomaly + shared model settings, no post-processing response lag.
-  - **Lag response**: optional first-order response lag is added after model evaluation.
-  - **Lag + drift**: linear trajectory drift is added between a start and final predictor value, plus response lag.
-- A common, shared environmental anomaly is generated once (mean-reverting random walk) and added to each trajectory base path.
+- Two optional model effects are available:
+  - **Lag**: first-order response lag is applied after model evaluation.
+  - **Drift**: each trajectory follows a predictor trajectory that drifts linearly from start to final value.
+  - A common, shared environmental anomaly is generated once and then added to each trajectory base path.
+  - The default forcing mode is white noise (independent shocks, no memory). Optionally switch to mean-reverting forcing for persistent trajectories.
 - Each trajectory is evaluated through the same FvCB evaluator used in the photosynthesis tab, with all non-target parameters held fixed.
 - Baseline response is computed at each trajectory mean.
 - Trajectory anomalies are shown as:
   `response_anomaly[t] = lagged_response[t] - baseline_response`
 
-- Optional lag (`Response lag`) is applied **after** model evaluation, on each trajectory independently.
+ - Optional lag (`Response lag`) is applied **after** model evaluation using shared lag settings for all trajectories.
 
   For lag steps `k`, the exponential smoothing is:
 
@@ -1621,10 +2309,10 @@ def render_resilience_page():
 
 Higher lag values smooth and delay response to forcing, while all other model physics and diagnostics remain unchanged.
 
-For the **Lag + drift** tier, each trajectory follows:
+When **Drift** is enabled, each trajectory follows:
 
 - `predictor(t) = drift_start + (drift_end - drift_start) * (t / (T-1))`
-- Shared anomalies from the random walk are added afterward.
+- Shared anomalies are added afterward based on the selected forcing mode.
                 """
             )
         with st.expander("Visual settings", expanded=False):
@@ -1651,15 +2339,34 @@ For the **Lag + drift** tier, each trajectory follows:
                 key="display_height",
                 help="Controls the overall height scale of the resilience plots.",
             )
-            animation_height = int(min(1800, max(450, round(display_height * 1.5))))
-            diagnostic_height = int(max(260, min(680, round(display_height * 0.45))))
-
-        with st.expander("Curve setup", expanded=False):
-            resilience_tier = st.selectbox(
-                "Resilience model tier",
-                options=resilience_tier_options,
-                key="resilience_model_tier",
+            trajectory_count = st.slider(
+                "Number of trajectories",
+                min_value=1,
+                max_value=6,
+                value=trajectory_count,
+                step=1,
+                key="resilience_trajectory_count",
             )
+            trajectory_steps = st.slider(
+                "Trajectory length (steps)",
+                min_value=40,
+                max_value=360,
+                value=trajectory_steps,
+                step=5,
+                key="resilience_trajectory_steps",
+            )
+            frame_speed_ms = st.slider(
+                "Animation frame speed (ms)",
+                min_value=20,
+                max_value=800,
+                value=frame_speed_ms,
+                step=10,
+                key="resilience_frame_speed_ms",
+            )
+            animation_height = int(min(1800, max(450, round(display_height * 1.5))))
+            diagnostic_height = int(max(320, min(720, round(display_height * 0.52))))
+
+        with st.expander("Setup - Disturbance", expanded=False):
             response_var = st.selectbox(
                 "Target (y-axis)",
                 options=RESPONSE_OPTIONS,
@@ -1667,27 +2374,232 @@ For the **Lag + drift** tier, each trajectory follows:
                 format_func=_response_axis_label,
             )
             predictor = st.selectbox(
-                "Predictor trajectory (x-axis)",
+                "Fluctuating predictor (disturbance axis)",
                 options=PREDICTOR_OPTIONS,
                 key="resilience_predictor",
                 format_func=_predictor_axis_label,
             )
             predictor = _normalize_predictor(predictor)
             predictor_config = PREDICTOR_CONFIG[predictor]
+
             default_mean_key = f"resilience_default_mean_{predictor}"
             default_mean_value = float(
                 st.session_state.get(default_mean_key, predictor_config["default"])
             )
+            default_mean_value = st.slider(
+                f"Reference mean {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                min_value=float(predictor_config["min"]),
+                max_value=float(predictor_config["max"]),
+                value=default_mean_value,
+                step=float(predictor_config["step"]),
+                key=default_mean_key,
+                help="Shared baseline value for the disturbance predictor before perturbations are added.",
+            )
+
+            st.caption(
+                "This shared setpoint anchors all trajectories on the disturbance axis. "
+                "Individual trajectory setpoints are configured per trajectory in the setpoint section."
+            )
+
+        with st.expander("Setup - Setpoint", expanded=False):
+            resilience_2d_mode = st.toggle(
+                "2D resilience",
+                value=resilience_2d_mode,
+                key="resilience_2d_mode",
+                help=(
+                    "Use one shared forcing predictor trajectory, while each trajectory has a "
+                    "different fixed value for a second conditioning predictor."
+                ),
+            )
+            if resilience_2d_mode:
+                if not st.session_state.get("resilience_2d_mode_initialized", False):
+                    st.session_state["resilience_predictor"] = "PAR"
+                    predictor = "PAR"
+                    predictor_config = PREDICTOR_CONFIG[predictor]
+                    resilience_condition_predictor = "T_leaf"
+                    st.session_state["resilience_condition_predictor"] = resilience_condition_predictor
+                    st.session_state["resilience_condition_T_leaf_0"] = 25.0
+                    st.session_state["resilience_condition_T_leaf_1"] = 35.0
+                    st.session_state["resilience_2d_mode_initialized"] = True
+                condition_options = [p for p in PREDICTOR_OPTIONS if p != predictor]
+                if resilience_condition_predictor not in condition_options:
+                    resilience_condition_predictor = condition_options[0]
+                    st.session_state["resilience_condition_predictor"] = resilience_condition_predictor
+                resilience_condition_predictor = st.selectbox(
+                    "Conditioning predictor (static)",
+                    options=condition_options,
+                    key="resilience_condition_predictor",
+                    format_func=_predictor_axis_label,
+                )
+                resilience_condition_predictor = _normalize_predictor(resilience_condition_predictor)
+            else:
+                st.session_state["resilience_2d_mode_initialized"] = False
+                resilience_condition_predictor = st.session_state.get("resilience_condition_predictor", "T_leaf")
+
+            resilience_auto_update = st.toggle(
+                "Auto-update resilience simulation",
+                value=st.session_state.get("resilience_auto_update", False),
+                key="resilience_auto_update",
+                help="When enabled, simulation recomputes continuously as controls change. Disable for click-to-apply behavior.",
+            )
+            enable_lag = st.toggle(
+                "Enable lag",
+                value=enable_lag,
+                key="resilience_enable_lag",
+                help="Adds post-processing response lag to each trajectory.",
+            )
+            enable_drift = st.toggle(
+                "Enable drift",
+                value=enable_drift,
+                key="resilience_enable_drift",
+                help="Adds a linear start-to-final drift to each trajectory baseline.",
+            )
+
+        with st.expander("Forcing statistics", expanded=False):
             amplitude_key = f"resilience_fluctuation_scale_{predictor}"
+            fluctuation_scale_mode = st.selectbox(
+                "Fluctuation scale",
+                ["Absolute units", "Percent of mean"],
+                index=0 if fluctuation_scale_mode == "Absolute units" else 1,
+                key="resilience_fluctuation_mode",
+            )
             if fluctuation_scale_mode == "Absolute units":
-                fluctuation_scale = float(
-                    st.session_state.get(amplitude_key, predictor_config["amplitude"])
+                fluctuation_scale = st.slider(
+                    f"Default fluctuation amplitude ({predictor_config['unit']})",
+                    min_value=float(predictor_config["step"]),
+                    max_value=float((predictor_config["max"] - predictor_config["min"]) / 2.0),
+                    value=float(st.session_state.get(amplitude_key, predictor_config["amplitude"])),
+                    step=float(predictor_config["step"]),
+                    key=amplitude_key,
                 )
             else:
+                fluctuation_scale_pct = st.slider(
+                    "Fluctuation (% of mean)",
+                    min_value=1,
+                    max_value=30,
+                    value=fluctuation_scale_pct,
+                    step=1,
+                    key="resilience_fluctuation_scale_pct",
+                )
                 fluctuation_scale = default_mean_value * (fluctuation_scale_pct / 100.0)
+                st.caption(
+                    f"Default effective amplitude: {fluctuation_scale:.2f} {predictor_config['unit']}"
+                )
+            forcing_mode = st.selectbox(
+                "Environmental forcing memory",
+                options=["white", "mean_reverting"],
+                format_func=lambda value: "White noise (no memory)"
+                if value == "white"
+                else "Mean-reverting random walk",
+                index=0 if forcing_mode == "white" else 1,
+                key="resilience_forcing_mode",
+                help="White noise produces independent forcing shocks each step; mean-reverting introduces persistence.",
+            )
+            forcing_white_noise = forcing_mode == "white"
+            mean_reversion = st.slider(
+                "Default mean reversion strength",
+                min_value=0.0,
+                max_value=0.95,
+                value=mean_reversion,
+                step=0.05,
+                key="resilience_mean_reversion",
+                disabled=forcing_white_noise,
+            )
+            step_factor = st.slider(
+                "Default trajectory roughness",
+                min_value=0.2,
+                max_value=1.4,
+                value=step_factor,
+                step=0.05,
+                key="resilience_step_factor",
+                disabled=forcing_white_noise,
+            )
+            if forcing_white_noise:
+                st.caption(
+                    "Forcing memory is off by default: predictor anomaly has no autocorrelation by construction."
+                )
+            seed = st.number_input(
+                "Default random seed",
+                min_value=0,
+                max_value=999999,
+                value=seed,
+                step=1,
+                key="resilience_seed",
+            )
+
+        with st.expander("Resilience indicators", expanded=False):
+            indicator_window = st.slider(
+                "Variance/autocorrelation rolling window (steps)",
+                min_value=5,
+                max_value=max(5, trajectory_steps),
+                value=min(indicator_window, max(5, trajectory_steps)),
+                step=1,
+                key="resilience_indicator_window",
+                help=(
+                    "Window size used for rolling variance and rolling autocorrelation calculations."
+                ),
+            )
+            diagnostic_window = st.slider(
+                "MK test rolling window (steps)",
+                min_value=5,
+                max_value=max(5, trajectory_steps),
+                value=min(diagnostic_window, max(5, trajectory_steps)),
+                step=1,
+                key="resilience_diagnostic_window",
+                help=(
+                    "Window size used for rolling series used in the "
+                    "Kendall-Mann trend diagnostics."
+                ),
+            )
 
         trajectory_settings = []
+        lag_reference_key = f"resilience_lag_reference_{predictor}"
+        lag_mode_key = f"resilience_lag_mode_{predictor}"
+        lag_sensitivity_key = f"resilience_lag_sensitivity_{predictor}"
+        lag_reference_default_base = (
+            float(st.session_state.get("temp_optimum_c", 25.0))
+            if predictor == "T_leaf"
+            else float(predictor_config["default"])
+        )
+        lag_steps_global = int(
+            st.session_state.get(
+                "resilience_lag_steps",
+                st.session_state.get("resilience_lag_default_steps", 1),
+            )
+        )
+        lag_mode = st.session_state.get(
+            lag_mode_key,
+            st.session_state.get("resilience_lag_mode", "Fixed lag"),
+        )
+        lag_reference = float(
+            st.session_state.get(
+                lag_reference_key,
+                st.session_state.get(
+                    f"resilience_lag_reference_{predictor}_0",
+                    lag_reference_default_base,
+                ),
+            )
+        )
+        lag_sensitivity = float(
+            st.session_state.get(
+                lag_sensitivity_key,
+                st.session_state.get(
+                    f"resilience_lag_sensitivity_{predictor}_0",
+                    float(st.session_state.get("resilience_lag_sensitivity", 1.0)),
+                ),
+            )
+        )
+
         with st.expander("Per-trajectory settings", expanded=False):
+            trajectory_names = []
+            trajectory_means = []
+            trajectory_secondary_values = []
+            if resilience_2d_mode:
+                condition_config = PREDICTOR_CONFIG[_normalize_predictor(resilience_condition_predictor)]
+                condition_unit = str(condition_config["unit"])
+                condition_min = float(condition_config["min"])
+                condition_max = float(condition_config["max"])
+                condition_step = float(condition_config["step"])
             for idx in range(trajectory_count):
                 if idx > 0:
                     st.divider()
@@ -1698,167 +2610,192 @@ For the **Lag + drift** tier, each trajectory follows:
                     key=name_key,
                     placeholder="e.g., Healthy",
                 )
-                st.markdown(f"**{trajectory_name or _default_trajectory_name(idx)} settings**")
-                st.caption(
-                    "In **Lag response**, this controls how slowly the response follows forcing."
-                    if enable_lag
-                    else "Lag is not used in the Basic tier."
-                )
-                mean_value = st.slider(
-                    f"Mean {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
-                    min_value=float(predictor_config["min"]),
-                    max_value=float(predictor_config["max"]),
-                    value=_default_trajectory_mean(predictor, idx),
-                    step=float(predictor_config["step"]),
-                    key=f"resilience_mean_{predictor}_{idx}",
-                )
-                if enable_drift:
+                cleaned_name = trajectory_name.strip() or _default_trajectory_name(idx)
+                trajectory_names.append(cleaned_name)
+                st.markdown(f"**{cleaned_name} settings**")
+                if enable_lag or enable_drift:
+                    st.caption(
+                        "Lag controls are configured in **Lag settings** and drift controls in **Drift settings**."
+                    )
+                if not enable_drift:
+                    if resilience_2d_mode:
+                        mean_value = float(default_mean_value)
+                        st.caption(
+                            f"Shared mean from **Predictor baseline**: "
+                            f"{mean_value:.2f} {predictor_config['unit']}."
+                        )
+                    else:
+                        mean_value = st.slider(
+                            f"Mean {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                            min_value=float(predictor_config["min"]),
+                            max_value=float(predictor_config["max"]),
+                            value=float(st.session_state.get(
+                                f"resilience_mean_{predictor}_{idx}",
+                                _default_trajectory_mean(predictor, idx),
+                            )),
+                            step=float(predictor_config["step"]),
+                            key=f"resilience_mean_{predictor}_{idx}",
+                            help=(
+                                "Trajectory-specific mean. The anomaly trajectory is added on top of this "
+                                "value to create this trajectory’s forcing path."
+                            ),
+                        )
+                    trajectory_means.append(mean_value)
+                if resilience_2d_mode:
+                    secondary_value = float(
+                        st.slider(
+                            f"{_predictor_axis_label(resilience_condition_predictor)} ({condition_unit})",
+                            min_value=condition_min,
+                            max_value=condition_max,
+                            value=float(
+                                st.session_state.get(
+                                    f"resilience_condition_{resilience_condition_predictor}_{idx}",
+                                    25.0
+                                    if idx == 0 and resilience_condition_predictor == "T_leaf"
+                                    else 35.0
+                                    if idx == 1 and resilience_condition_predictor == "T_leaf"
+                                    else float(condition_config["default"]),
+                                )
+                            ),
+                            step=condition_step,
+                            key=f"resilience_condition_{resilience_condition_predictor}_{idx}",
+                        )
+                    )
+                    trajectory_secondary_values.append(secondary_value)
+                else:
+                    trajectory_secondary_values.append(np.nan)
+    
+        trajectory_drift_starts = []
+        trajectory_drift_ends = []
+        if enable_drift:
+            with st.expander("Drift settings", expanded=False):
+                for idx in range(trajectory_count):
+                    if idx > 0:
+                        st.divider()
+                    trajectory_default = float(_default_trajectory_mean(predictor, idx))
+                    if predictor == "T_leaf":
+                        if idx == 0:
+                            drift_default_start = 15.0
+                            drift_default_end = 25.0
+                        elif idx == 1:
+                            drift_default_start = 25.0
+                            drift_default_end = 35.0
+                        else:
+                            drift_default_start = trajectory_default
+                            drift_default_end = trajectory_default
+                        default_start = float(st.session_state.get(f"resilience_drift_start_{predictor}_{idx}", drift_default_start))
+                        default_end = float(st.session_state.get(f"resilience_drift_end_{predictor}_{idx}", drift_default_end))
+                    else:
+                        default_start = float(st.session_state.get(f"resilience_drift_start_{predictor}_{idx}", trajectory_default))
+                        default_end = float(st.session_state.get(f"resilience_drift_end_{predictor}_{idx}", trajectory_default))
                     drift_start_key = f"resilience_drift_start_{predictor}_{idx}"
                     drift_end_key = f"resilience_drift_end_{predictor}_{idx}"
                     drift_start = st.slider(
-                        f"Start {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                        f"Start {_predictor_axis_label(predictor)} ({predictor_config['unit']}) (traj {idx + 1})",
                         min_value=float(predictor_config["min"]),
                         max_value=float(predictor_config["max"]),
-                        value=float(st.session_state.get(drift_start_key, mean_value)),
+                        value=default_start,
                         step=float(predictor_config["step"]),
                         key=drift_start_key,
                     )
                     drift_end = st.slider(
-                        f"Final {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                        f"Final {_predictor_axis_label(predictor)} ({predictor_config['unit']}) (traj {idx + 1})",
                         min_value=float(predictor_config["min"]),
                         max_value=float(predictor_config["max"]),
-                        value=float(st.session_state.get(drift_end_key, mean_value)),
+                        value=default_end,
                         step=float(predictor_config["step"]),
                         key=drift_end_key,
                     )
-                else:
-                    drift_start = float(st.session_state.get(f"resilience_drift_start_{predictor}_{idx}", mean_value))
-                    drift_end = float(st.session_state.get(f"resilience_drift_end_{predictor}_{idx}", mean_value))
-                if enable_lag:
-                    lag_key = f"resilience_lag_{predictor}_{idx}"
-                    lag_steps = st.slider(
-                        "Response lag (steps)",
-                        min_value=0,
-                        max_value=60,
-                        value=int(st.session_state.get(lag_key, lag_default_steps)),
-                        step=1,
-                        key=lag_key,
-                        help="0 = immediate; higher values produce a slower response to forcing.",
+                    trajectory_drift_starts.append(float(drift_start))
+                    trajectory_drift_ends.append(float(drift_end))
+        else:
+            for idx in range(trajectory_count):
+                trajectory_default = float(_default_trajectory_mean(predictor, idx))
+                trajectory_drift_starts.append(
+                    float(st.session_state.get(f"resilience_drift_start_{predictor}_{idx}", trajectory_default))
+                )
+                trajectory_drift_ends.append(
+                    float(st.session_state.get(f"resilience_drift_end_{predictor}_{idx}", trajectory_default))
+                )
+
+        if enable_drift:
+            trajectory_means = [
+                0.5 * (trajectory_drift_starts[idx] + trajectory_drift_ends[idx])
+                for idx in range(trajectory_count)
+            ]
+    
+        if enable_lag:
+            with st.expander("Lag settings", expanded=False):
+                lag_steps_global = st.slider(
+                    "Response lag (steps)",
+                    min_value=0,
+                    max_value=60,
+                    value=lag_steps_global,
+                    step=1,
+                    key="resilience_lag_steps",
+                    help="0 = immediate; higher values produce a slower response to forcing.",
+                )
+                lag_mode = st.selectbox(
+                    "Lag mode",
+                    options=["Fixed lag", "Reference-based lag"],
+                    index=0 if lag_mode == "Fixed lag" else 1,
+                    key=lag_mode_key,
+                    help="Use reference-based lag if lag changes with stress relative to the chosen reference.",
+                )
+                if lag_mode == "Reference-based lag":
+                    if predictor == "T_leaf":
+                        lag_reference = float(st.session_state.get("temp_optimum_c", lag_reference_default_base))
+                        st.caption(
+                            f"Lag reference fixed to temperature optimum: {lag_reference:.2f} °C"
+                        )
+                    else:
+                        lag_reference = st.slider(
+                            "Lag reference",
+                            min_value=float(predictor_config["min"]),
+                            max_value=float(predictor_config["max"]),
+                            value=lag_reference,
+                            step=float(predictor_config["step"]),
+                            key=lag_reference_key,
+                            help="Higher lag when predictor moves away from this value.",
+                        )
+                    lag_sensitivity = st.slider(
+                        "Distance sensitivity",
+                        min_value=0.0,
+                        max_value=5.0,
+                        value=lag_sensitivity,
+                        step=0.05,
+                        key=lag_sensitivity_key,
+                        help="Scales how strongly distance from the reference increases lag.",
                     )
                 else:
-                    lag_steps = 0
-                trajectory_settings.append(
-                    {
-                        "name": trajectory_name.strip() or _default_trajectory_name(idx),
-                        "mean_value": mean_value,
-                        "lag_steps": lag_steps,
-                        "drift_start": drift_start,
-                        "drift_end": drift_end,
-                    }
-                )
-
-        with st.expander("Trajectory setup", expanded=False):
-            lag_default_steps = st.slider(
-                "Default response lag (steps)",
-                min_value=0,
-                max_value=60,
-                value=int(st.session_state.get("resilience_lag_default_steps", 0)),
-                step=1,
-                key="resilience_lag_default_steps",
-                help="Used as the starting lag value for new trajectory settings.",
+                    if predictor == "T_leaf":
+                        lag_reference = float(st.session_state.get("temp_optimum_c", lag_reference_default_base))
+                    else:
+                        lag_reference = float(st.session_state.get(lag_reference_key, lag_reference_default_base))
+        else:
+            lag_steps_global = 0
+            lag_mode = "Fixed lag"
+            lag_reference = float(st.session_state.get("temp_optimum_c", lag_reference_default_base))
+    
+        trajectory_settings = []
+        for idx in range(trajectory_count):
+            trajectory_settings.append(
+                {
+                    "name": trajectory_names[idx],
+                    "mean_value": trajectory_means[idx],
+                    "secondary_value": float(trajectory_secondary_values[idx]),
+                    "secondary_predictor": resilience_condition_predictor,
+                    "lag_steps": int(lag_steps_global),
+                    "lag_mode": lag_mode,
+                    "lag_reference": lag_reference,
+                    "lag_sensitivity": lag_sensitivity,
+                    "drift_start": trajectory_drift_starts[idx],
+                    "drift_end": trajectory_drift_ends[idx],
+                }
             )
-            trajectory_count = st.slider(
-                "Number of trajectories",
-                min_value=1,
-                max_value=6,
-                value=2,
-                step=1,
-                key="resilience_trajectory_count",
-            )
-            trajectory_steps = st.slider(
-                "Trajectory length (steps)",
-                min_value=40,
-                max_value=360,
-                value=120,
-                step=5,
-                key="resilience_trajectory_steps",
-            )
-            default_mean_value = st.slider(
-                f"Default mean {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
-                min_value=float(predictor_config["min"]),
-                max_value=float(predictor_config["max"]),
-                value=float(predictor_config["default"]),
-                step=float(predictor_config["step"]),
-                key=default_mean_key,
-            )
-            fluctuation_scale_mode = st.selectbox(
-                "Fluctuation scale",
-                ["Absolute units", "Percent of mean"],
-                index=0,
-                key="resilience_fluctuation_mode",
-            )
-            if fluctuation_scale_mode == "Absolute units":
-                fluctuation_scale = st.slider(
-                    f"Default fluctuation amplitude ({predictor_config['unit']})",
-                    min_value=float(predictor_config["step"]),
-                    max_value=float((predictor_config["max"] - predictor_config["min"]) / 2.0),
-                    value=float(predictor_config["amplitude"]),
-                    step=float(predictor_config["step"]),
-                    key=amplitude_key,
-                )
-            else:
-                fluctuation_scale_pct = st.slider(
-                    "Fluctuation (% of mean)",
-                    min_value=1,
-                    max_value=30,
-                    value=5,
-                    step=1,
-                    key="resilience_fluctuation_scale_pct",
-                )
-                fluctuation_scale = default_mean_value * (fluctuation_scale_pct / 100.0)
-                st.caption(
-                    f"Default effective amplitude: {fluctuation_scale:.2f} {predictor_config['unit']}"
-                )
-            mean_reversion = st.slider(
-                "Default mean reversion strength",
-                min_value=0.0,
-                max_value=0.95,
-                value=0.35,
-                step=0.05,
-                key="resilience_mean_reversion",
-            )
-            step_factor = st.slider(
-                "Default trajectory roughness",
-                min_value=0.2,
-                max_value=1.4,
-                value=0.55,
-                step=0.05,
-                key="resilience_step_factor",
-            )
-            seed = st.number_input(
-                "Default random seed",
-                min_value=0,
-                max_value=999999,
-                value=42,
-                step=1,
-                key="resilience_seed",
-            )
-            frame_speed_ms = st.slider(
-                "Animation frame speed (ms)",
-                min_value=20,
-                max_value=800,
-                value=110,
-                step=10,
-                key="resilience_frame_speed_ms",
-            )
-            if st.button("Reset trajectory state", use_container_width=True):
-                st.session_state["resilience_seed"] = 42
-                st.rerun()
-
+    
         with st.expander("Model parameters", expanded=False):
-            vcmax25 = st.slider(
-                "V_cmax,25 (µmol m⁻² s⁻¹)", 10.0, 250.0, 80.0, 1.0, key="vcmax25"
-            )
+            vcmax25 = st.slider("V_cmax,25 (µmol m⁻² s⁻¹)", 10.0, 250.0, 80.0, 1.0, key="vcmax25")
             jmax25 = st.slider("J_max,25 (µmol m⁻² s⁻¹)", 30.0, 400.0, 150.0, 1.0, key="jmax25")
             tpu_enabled = st.toggle(
                 "Enable TPU limitation in model",
@@ -1927,14 +2864,7 @@ For the **Lag + drift** tier, each trajectory follows:
                 100.0,
                 key="ko25",
             )
-            o2 = st.slider(
-                "O2 (µmol mol⁻¹)",
-                180000.0,
-                260000.0,
-                210000.0,
-                1000.0,
-                key="o2",
-            )
+            o2 = st.slider("O2 (µmol mol⁻¹)", 180000.0, 260000.0, 210000.0, 1000.0, key="o2")
 
         with st.expander("Environmental conditions", expanded=False):
             par = float(st.session_state.get("par", PREDICTOR_CONFIG["PAR"]["default"]))
@@ -1961,6 +2891,47 @@ For the **Lag + drift** tier, each trajectory follows:
                 st.caption("VPD is controlled by the predictor trajectories.")
             else:
                 vpd = st.slider("VPD (kPa)", 0.1, 6.0, 1.2, 0.1, key="vpd")
+
+        st.button(
+            "Reset all settings to defaults",
+            on_click=reset_all_settings,
+            use_container_width=True,
+            key="resilience_reset_all_settings",
+        )
+
+        st.markdown("### Quick presets")
+        st.markdown("#### Default 1D graphs")
+        st.button(
+            "1D: Shared disturbance only",
+            key="resilience_preset_default_1d",
+            use_container_width=True,
+            help="Return to 2D mode off with shared disturbance (no trajectory conditioning).",
+            on_click=_apply_resilience_1d_preset,
+        )
+        st.markdown("#### Default 2D graphs")
+        preset_col_1, preset_col_2 = st.columns(2)
+        with preset_col_1:
+            st.button(
+                "PAR fluctuations @ 25/35 °C",
+                key="resilience_preset_par_25_35",
+                use_container_width=True,
+                help=(
+                    "Shared PAR disturbance; trajectory T_leaf setpoints at 25 °C and 35 °C."
+                ),
+                on_click=_apply_resilience_preset,
+                args=("PAR", "T_leaf", 25.0, 35.0),
+            )
+        with preset_col_2:
+            st.button(
+                "T_leaf fluctuations @ 300/900 PAR",
+                key="resilience_preset_tleaf_300_900",
+                use_container_width=True,
+                help=(
+                    "Shared T_leaf disturbance; trajectory PAR setpoints at 300 and 900."
+                ),
+                on_click=_apply_resilience_preset,
+                args=("T_leaf", "PAR", 300.0, 900.0),
+            )
 
     profile = {
         "par": par,
@@ -1993,77 +2964,300 @@ For the **Lag + drift** tier, each trajectory follows:
     if not tpu_enabled:
         profile["tpu"] = 0.0
 
-    trajectory_means = np.asarray(
-        [settings["mean_value"] for settings in trajectory_settings],
-        dtype=float,
-    )
-    if enable_drift:
-        time_axis = np.linspace(0.0, 1.0, trajectory_steps, dtype=float)
-        trajectory_baselines = np.array(
-            [
-                settings["drift_start"]
-                + (settings["drift_end"] - settings["drift_start"]) * time_axis
-                for settings in trajectory_settings
-            ],
-            dtype=float,
-        )
-    else:
-        trajectory_baselines = trajectory_means[:, None] + np.zeros((trajectory_count, trajectory_steps), dtype=float)
-
-    lower_room = float(np.min(trajectory_baselines - predictor_config["min"]))
-    upper_room = float(np.min(predictor_config["max"] - trajectory_baselines))
-    shared_anomaly_limit = min(lower_room, upper_room)
-    if shared_anomaly_limit <= 0:
-        shared_anomaly = np.zeros(trajectory_steps, dtype=float)
-    else:
-        shared_anomaly = build_environment_trajectories(
-            base_value=0.0,
-            fluctuation_scale=fluctuation_scale,
-            steps=trajectory_steps,
-            trajectories=1,
-            seed=seed,
-            mean_reversion=mean_reversion,
-            step_factor=step_factor,
-            value_min=-shared_anomaly_limit,
-            value_max=shared_anomaly_limit,
-        )[0]
-    shared_anomaly = shared_anomaly - np.nanmean(shared_anomaly)
-    shared_anomaly_mean = float(np.nanmean(shared_anomaly))
-    trajectory_values = trajectory_baselines + shared_anomaly[None, :]
-    trajectory_response_raw = evaluate_curve_with_response(
-        predictor,
-        trajectory_values,
-        profile,
-        response_var,
-    )
-    trajectory_response = np.array(
-        [
-            apply_first_order_lag(
-                trajectory_response_raw[idx],
-                trajectory_settings[idx]["lag_steps"],
+    trajectory_display_names = []
+    for settings in trajectory_settings:
+        trajectory_name = settings["name"]
+        if resilience_2d_mode:
+            sec_label = _format_resilience_secondary_label(
+                settings.get("secondary_predictor", resilience_condition_predictor),
+                settings.get("secondary_value", np.nan),
             )
-            for idx in range(trajectory_count)
-        ],
-        dtype=float,
-    )
-    baseline_response = evaluate_curve_with_response(
+            trajectory_name = (
+                f"{trajectory_name} | {resilience_condition_predictor}={sec_label}"
+                if sec_label
+                else trajectory_name
+            )
+        trajectory_display_names.append(trajectory_name)
+
+    requested_signature = _resilience_sim_signature(
         predictor,
-        trajectory_means,
-        profile,
         response_var,
+        trajectory_steps,
+        diagnostic_window,
+        indicator_window,
+        enable_lag,
+        enable_drift,
+        forcing_white_noise,
+        resilience_2d_mode,
+        resilience_condition_predictor,
+        profile,
+        trajectory_settings,
+        fluctuation_scale,
+        mean_reversion,
+        step_factor,
+        seed,
+        frame_speed_ms,
+        lag_steps_global,
+        lag_mode,
+        lag_reference,
+        lag_sensitivity,
     )
-    predictor_anoms = trajectory_values - trajectory_means[:, None]
-    response_anoms = trajectory_response - baseline_response[:, None]
+    cached_signature = st.session_state.get("resilience_sim_signature")
+    cached_payload = st.session_state.get("resilience_sim_cached_payload")
+    signature_changed = cached_signature != requested_signature
+    should_run_simulation = resilience_auto_update or run_resilience_sim or cached_payload is None
+    if not should_run_simulation and signature_changed:
+        st.info(
+            "Resilience settings changed but live recalculation is disabled. Click **Run resilience simulation** "
+            "to refresh the curves."
+        )
+    if should_run_simulation:
+        with st.spinner("Running resilience simulation..."):
+            trajectory_means = np.asarray(
+                [settings["mean_value"] for settings in trajectory_settings],
+                dtype=float,
+            )
+            if enable_drift:
+                time_axis = np.linspace(0.0, 1.0, trajectory_steps, dtype=float)
+                trajectory_baselines = np.array(
+                    [
+                        settings["drift_start"]
+                        + (settings["drift_end"] - settings["drift_start"]) * time_axis
+                        for settings in trajectory_settings
+                    ],
+                    dtype=float,
+                )
+            else:
+                trajectory_baselines = trajectory_means[:, None] + np.zeros(
+                    (trajectory_count, trajectory_steps), dtype=float
+                )
 
-    finite_trajectory = np.isfinite(trajectory_response)
-    if not finite_trajectory.any():
-        st.error("No finite response values were produced with these settings. Relax constraints.")
-        return
+            lower_room = float(np.min(trajectory_baselines - predictor_config["min"]))
+            upper_room = float(np.min(predictor_config["max"] - trajectory_baselines))
+            shared_anomaly_limit = min(lower_room, upper_room)
+            if shared_anomaly_limit <= 0:
+                shared_anomaly = np.zeros(trajectory_steps, dtype=float)
+            else:
+                if forcing_white_noise:
+                    rng = np.random.default_rng(seed)
+                    shared_anomaly = rng.normal(
+                        loc=0.0, scale=fluctuation_scale, size=trajectory_steps
+                    )
+                    shared_anomaly = np.clip(
+                        shared_anomaly,
+                        -shared_anomaly_limit,
+                        shared_anomaly_limit,
+                    )
+                else:
+                    shared_anomaly = build_environment_trajectories(
+                        base_value=0.0,
+                        fluctuation_scale=fluctuation_scale,
+                        steps=trajectory_steps,
+                        trajectories=1,
+                        seed=seed,
+                        mean_reversion=mean_reversion,
+                        step_factor=step_factor,
+                        value_min=-shared_anomaly_limit,
+                        value_max=shared_anomaly_limit,
+                    )[0]
+            shared_anomaly = shared_anomaly - np.nanmean(shared_anomaly)
+            shared_anomaly_mean = float(np.nanmean(shared_anomaly))
+            trajectory_values = trajectory_baselines + shared_anomaly[None, :]
+            curve_min = min(float(predictor_config["min"]), float(np.nanmin(trajectory_values)))
+            curve_max = max(float(predictor_config["max"]), float(np.nanmax(trajectory_values)))
+            curve_x = build_x_axis(predictor, curve_min, curve_max, 500)
+            trajectory_response = np.empty_like(trajectory_values, dtype=float)
+            setpoint_axis = None
+            setpoint_curves = None
+            setpoint_secondary_response = None
+            if resilience_2d_mode:
+                setpoint_axis = build_x_axis(
+                    resilience_condition_predictor,
+                    PREDICTOR_CONFIG[resilience_condition_predictor]["min"],
+                    PREDICTOR_CONFIG[resilience_condition_predictor]["max"],
+                    500,
+                )
+                setpoint_curves = np.empty((trajectory_count, setpoint_axis.size), dtype=float)
+                setpoint_secondary_response = np.full((trajectory_count,), np.nan, dtype=float)
+                baseline_response = np.empty((trajectory_count,), dtype=float)
+                baseline_curve_response = np.empty(
+                    (trajectory_count, curve_x.size),
+                    dtype=float,
+                )
+                disturbance_profile_key = _predictor_profile_key(predictor)
+                for idx in range(trajectory_count):
+                    profile_i = dict(profile)
+                    secondary_value = trajectory_settings[idx].get("secondary_value", np.nan)
+                    secondary_predictor = trajectory_settings[idx].get(
+                        "secondary_predictor",
+                        resilience_condition_predictor,
+                    )
+                    secondary_profile_key = _predictor_profile_key(secondary_predictor)
+                    profile_i[disturbance_profile_key] = float(trajectory_means[idx])
+                    if np.isfinite(secondary_value):
+                        profile_i[secondary_profile_key] = float(secondary_value)
+                    trajectory_response[idx] = evaluate_curve_with_response(
+                        predictor,
+                        trajectory_values[idx],
+                        profile_i,
+                        response_var,
+                    )
+                    baseline_response[idx] = evaluate_curve_with_response(
+                        predictor,
+                        trajectory_means[idx],
+                        profile_i,
+                        response_var,
+                    )
+                    baseline_curve_response[idx] = evaluate_curve_with_response(
+                        predictor,
+                        curve_x,
+                        profile_i,
+                        response_var,
+                    )
+                    setpoint_curves[idx] = evaluate_curve_with_response(
+                        resilience_condition_predictor,
+                        setpoint_axis,
+                        profile_i,
+                        response_var,
+                    )
+                    if np.isfinite(secondary_value):
+                        setpoint_secondary_response[idx] = float(
+                            evaluate_curve_with_response(
+                                resilience_condition_predictor,
+                                np.array([float(secondary_value)], dtype=float),
+                                profile_i,
+                                response_var,
+                            )[0]
+                        )
+            else:
+                trajectory_response[:] = evaluate_curve_with_response(
+                    predictor,
+                    trajectory_values,
+                    profile,
+                    response_var,
+                )
+                baseline_response = evaluate_curve_with_response(
+                    predictor,
+                    trajectory_means,
+                    profile,
+                    response_var,
+                )
+                baseline_curve_response = evaluate_curve_with_response(
+                    predictor,
+                    curve_x,
+                    profile,
+                    response_var,
+                )
+            for idx in range(trajectory_count):
+                lag_k = int(trajectory_settings[idx]["lag_steps"])
+                if lag_k <= 0:
+                    continue
+                trajectory_response[idx] = apply_first_order_lag(
+                    trajectory_response[idx],
+                    lag_k,
+                    predictor_values=(
+                        trajectory_values[idx]
+                        if trajectory_settings[idx].get("lag_mode", "Fixed lag") != "Fixed lag"
+                        else None
+                    ),
+                    lag_reference=float(trajectory_settings[idx].get("lag_reference", trajectory_means[idx])),
+                    lag_sensitivity=float(trajectory_settings[idx].get("lag_sensitivity", 1.0)),
+                    use_distance_weight=(
+                        trajectory_settings[idx].get("lag_mode", "Fixed lag") != "Fixed lag"
+                    ),
+                )
+            predictor_anoms = trajectory_values - trajectory_means[:, None]
+            response_anoms = trajectory_response - baseline_response[:, None]
 
-    curve_min = min(float(predictor_config["min"]), float(np.nanmin(trajectory_values)))
-    curve_max = max(float(predictor_config["max"]), float(np.nanmax(trajectory_values)))
-    curve_x = build_x_axis(predictor, curve_min, curve_max, 500)
-    curve_y = evaluate_curve_with_response(predictor, curve_x, profile, response_var)
+            finite_trajectory = np.isfinite(trajectory_response)
+            if not finite_trajectory.any():
+                st.error("No finite response values were produced with these settings. Relax constraints.")
+                return
+
+            effective_diagnostic_window = max(5, min(diagnostic_window, trajectory_steps))
+            effective_indicator_window = max(5, min(indicator_window, trajectory_steps))
+            rolling_variance = rolling_window_variance(
+                response_anoms,
+                effective_indicator_window,
+            )
+            rolling_autocorrelation = rolling_window_lag1_autocorrelation(
+                response_anoms,
+                effective_indicator_window,
+            )
+
+            st.session_state["resilience_sim_signature"] = requested_signature
+            st.session_state["resilience_sim_cached_payload"] = {
+                "predictor": predictor,
+                "response_var": response_var,
+                "resilience_2d_mode": resilience_2d_mode,
+                "resilience_condition_predictor": resilience_condition_predictor,
+                "trajectory_settings": trajectory_settings.copy(),
+                "trajectory_display_names": trajectory_display_names,
+                "trajectory_count": trajectory_count,
+                "trajectory_means": trajectory_means,
+                "trajectory_values": trajectory_values,
+                "trajectory_response": trajectory_response,
+                "predictor_anoms": predictor_anoms,
+                "response_anoms": response_anoms,
+                "curve_x": curve_x,
+                "curve_y": baseline_curve_response,
+                "shared_anomaly_mean": shared_anomaly_mean,
+                "baseline_response": baseline_response,
+                "rolling_variance": rolling_variance,
+                "rolling_autocorrelation": rolling_autocorrelation,
+                "frame_speed_ms": frame_speed_ms,
+                "seed": seed,
+                "fluctuation_scale": fluctuation_scale,
+                "trajectory_steps": trajectory_steps,
+                "enable_lag": enable_lag,
+                "enable_drift": enable_drift,
+                "curve_min": curve_min,
+                "curve_max": curve_max,
+                "indicator_window": effective_indicator_window,
+                "diagnostic_window": effective_diagnostic_window,
+                "setpoint_axis": setpoint_axis,
+                "setpoint_curves": setpoint_curves,
+                "setpoint_secondary_response": setpoint_secondary_response,
+                "signature": requested_signature,
+            }
+        sim_data = st.session_state["resilience_sim_cached_payload"]
+    else:
+        if not isinstance(cached_payload, dict):
+            st.warning("No cached resilience result is available yet. Run the simulation once.")
+            return
+        sim_data = cached_payload
+
+    trajectory_settings = sim_data["trajectory_settings"]
+    trajectory_display_names = sim_data.get(
+        "trajectory_display_names",
+        [settings["name"] for settings in trajectory_settings],
+    )
+    resilience_2d_mode = bool(sim_data.get("resilience_2d_mode", False))
+    resilience_condition_predictor = sim_data.get("resilience_condition_predictor", resilience_condition_predictor)
+    trajectory_count = int(sim_data["trajectory_count"])
+    trajectory_values = sim_data["trajectory_values"]
+    trajectory_response = sim_data["trajectory_response"]
+    predictor_anoms = sim_data["predictor_anoms"]
+    response_anoms = sim_data["response_anoms"]
+    curve_x = sim_data["curve_x"]
+    curve_y = sim_data["curve_y"]
+    rolling_variance = sim_data["rolling_variance"]
+    rolling_autocorrelation = sim_data["rolling_autocorrelation"]
+    shared_anomaly_mean = float(sim_data["shared_anomaly_mean"])
+    frame_speed_ms = int(sim_data["frame_speed_ms"])
+    trajectory_steps = int(sim_data["trajectory_steps"])
+    fluctuation_scale = float(sim_data["fluctuation_scale"])
+    seed = int(sim_data["seed"])
+    enable_lag = bool(sim_data["enable_lag"])
+    enable_drift = bool(sim_data["enable_drift"])
+    predictor = sim_data["predictor"]
+    response_var = sim_data["response_var"]
+    diagnostic_window = int(sim_data.get("diagnostic_window", diagnostic_window))
+    indicator_window = int(sim_data.get("indicator_window", diagnostic_window))
+    setpoint_axis = sim_data.get("setpoint_axis")
+    setpoint_curves = sim_data.get("setpoint_curves")
+    setpoint_secondary_response = sim_data.get("setpoint_secondary_response")
+    predictor_config = PREDICTOR_CONFIG[predictor]
     predictor_axis_label = _predictor_unit_label(predictor)
     response_axis_label = _response_unit_label(response_var)
     chart_container, chart_col = _build_centered_chart_container(display_width)
@@ -2071,11 +3265,22 @@ For the **Lag + drift** tier, each trajectory follows:
     with st.container():
         st.subheader("Trajectory simulation")
         if enable_drift:
-            st.caption("Tier: **Lag + drift**. Trajectories drift linearly between start and final predictor values.")
+            if enable_lag:
+                st.caption(
+                    "Mode: **Lag + drift**. Shared forcing anomalies are lagged and each trajectory drifts "
+                    "linearly from its start to final predictor value."
+                )
+            else:
+                st.caption(
+                    "Mode: **Drift only**. Shared forcing anomalies are applied to trajectories whose predictors "
+                    "drift linearly from start to final value."
+                )
         elif enable_lag:
-            st.caption("Tier: **Lag response**. Trajectories follow shared anomalies with first-order lag.")
+            st.caption(
+                "Mode: **Lag only**. Shared forcing anomalies are applied with first-order lag."
+            )
         else:
-            st.caption("Tier: **Basic**. Trajectories are shared-anomaly mean paths without lag or drift.")
+            st.caption("Mode: **Basic**. Trajectories are shared-anomaly mean paths without lag or drift.")
         st.caption(
             f"Shared predictor anomaly is mean-centered: average Δ{_predictor_axis_label(predictor)} "
             f"= {shared_anomaly_mean:.4f}."
@@ -2089,9 +3294,10 @@ For the **Lag + drift** tier, each trajectory follows:
             baseline_curve_response=curve_y,
             predictor_label=predictor_axis_label,
             response_label=response_axis_label,
-            trajectory_names=[settings["name"] for settings in trajectory_settings],
+            trajectory_names=trajectory_display_names,
             frame_speed_ms=frame_speed_ms,
             chart_height=animation_height,
+            baseline_curve_names=trajectory_display_names,
         )
         if figure is None:
             st.warning("Animation figure could not be created. Verify Plotly availability.")
@@ -2099,97 +3305,130 @@ For the **Lag + drift** tier, each trajectory follows:
             with chart_container[chart_col]:
                 st.plotly_chart(figure, use_container_width=True)
                 st.caption(
-                    f"Anomalies panel legend: solid shared Δ{predictor_axis_label} forcing line, colored "
-                    f"solid Δ{response_axis_label} trajectories, circle markers = current state per trajectory."
+                    f"Anomalies panel: dotted zero baselines at Δ{predictor_axis_label}=0 (left axis) "
+                    f"and Δ{response_axis_label}=0 (right axis); solid shared Δ{predictor_axis_label} forcing; "
+                    f"solid colored Δ{response_axis_label} trajectories with current-state markers."
                 )
+                if resilience_2d_mode and setpoint_axis is not None and setpoint_curves is not None:
+                    secondary_values = np.asarray(
+                        [settings.get("secondary_value", np.nan) for settings in trajectory_settings],
+                        dtype=float,
+                    )
+                    secondary_responses = np.asarray(
+                        setpoint_secondary_response
+                        if setpoint_secondary_response is not None
+                        else np.full(trajectory_count, np.nan),
+                        dtype=float,
+                    )
+                    setpoint_figure = build_resilience_setpoint_curve_figure(
+                        setpoint_axis=setpoint_axis,
+                        setpoint_curves=setpoint_curves,
+                        trajectory_names=trajectory_display_names,
+                        secondary_values=secondary_values,
+                        secondary_responses=secondary_responses,
+                        setpoint_label=_predictor_unit_label(resilience_condition_predictor),
+                        response_label=response_axis_label,
+                        chart_height=diagnostic_height,
+                        trajectory_colors=_trajectory_colors(trajectory_count),
+                    )
+                    if setpoint_figure is not None:
+                        st.divider()
+                        st.plotly_chart(setpoint_figure, use_container_width=True)
+                        st.caption(
+                            f"Setpoint response curves at fixed disturbance baseline for "
+                            f"{_predictor_axis_label(resilience_condition_predictor)}; markers indicate each trajectory's "
+                            f"configured setpoint."
+                        )
 
-    summary = pd.DataFrame(
-        [
-            {
-                "Trajectory": trajectory_settings[idx]["name"],
-                f"Mean {predictor_axis_label}": trajectory_settings[idx]["mean_value"],
-                f"Shared amplitude ({predictor_config['unit']})": fluctuation_scale,
-                "Shared seed": seed,
-                f"Start {_predictor_axis_label(predictor)}": float(trajectory_settings[idx]["drift_start"]),
-                f"Final {_predictor_axis_label(predictor)}": float(trajectory_settings[idx]["drift_end"]),
-                f"Peak Δ{_predictor_axis_label(predictor)}": float(np.nanmax(np.abs(predictor_anoms[idx]))),
-                f"Final Δ{_predictor_axis_label(predictor)}": float(predictor_anoms[idx, -1]),
-                f"Min Δ{_response_axis_label(response_var)}": float(np.nanmin(response_anoms[idx])),
-                f"Max Δ{_response_axis_label(response_var)}": float(np.nanmax(response_anoms[idx])),
-                f"Final Δ{_response_axis_label(response_var)}": float(response_anoms[idx, -1]),
-            }
-            for idx in range(trajectory_count)
-        ]
-    )
+    summary_rows = []
+    for idx in range(trajectory_count):
+        row = {
+            "Trajectory": trajectory_display_names[idx],
+            f"Mean {predictor_axis_label}": trajectory_settings[idx]["mean_value"],
+            f"Shared amplitude ({predictor_config['unit']})": fluctuation_scale,
+            "Shared seed": seed,
+            f"Start {_predictor_axis_label(predictor)}": float(trajectory_settings[idx]["drift_start"]),
+            f"Final {_predictor_axis_label(predictor)}": float(trajectory_settings[idx]["drift_end"]),
+            f"Peak Δ{_predictor_axis_label(predictor)}": float(np.nanmax(np.abs(predictor_anoms[idx]))),
+            f"Final Δ{_predictor_axis_label(predictor)}": float(predictor_anoms[idx, -1]),
+            f"Min Δ{_response_axis_label(response_var)}": float(np.nanmin(response_anoms[idx])),
+            f"Max Δ{_response_axis_label(response_var)}": float(np.nanmax(response_anoms[idx])),
+            f"Final Δ{_response_axis_label(response_var)}": float(response_anoms[idx, -1]),
+        }
+        if resilience_2d_mode:
+            row[f"Condition ({_predictor_axis_label(resilience_condition_predictor)})"] = float(
+                trajectory_settings[idx].get("secondary_value", np.nan)
+            )
+        summary_rows.append(row)
 
-    diagnostic_window = min(30, max(5, trajectory_steps // 4))
-    rolling_variance = rolling_window_variance(response_anoms, diagnostic_window)
-    rolling_autocorrelation = rolling_window_lag1_autocorrelation(
-        response_anoms,
-        diagnostic_window,
-    )
-    autocorr_finite = rolling_autocorrelation[np.isfinite(rolling_autocorrelation)]
-    if autocorr_finite.size:
-        autocorr_min = float(np.nanmin(autocorr_finite))
-        autocorr_max = float(np.nanmax(autocorr_finite))
-        autocorr_span = autocorr_max - autocorr_min
-        if autocorr_span == 0.0:
-            pad = max(0.05, abs(autocorr_max) * 0.5) if np.isfinite(autocorr_max) else 0.05
-            if pad == 0.0:
-                pad = 0.05
-            autocorr_min -= pad
-            autocorr_max += pad
-        else:
-            pad = max(0.05, 0.15 * autocorr_span)
-            autocorr_min -= pad
-            autocorr_max += pad
-        if autocorr_min > 0:
-            autocorr_min = -pad
-        if autocorr_max < 0:
-            autocorr_max = pad
-        autocorr_min = max(-1.0, autocorr_min)
-        autocorr_max = min(1.0, autocorr_max)
-        autocorr_y_range = [autocorr_min, autocorr_max]
-    else:
-        autocorr_y_range = [-1.0, 1.0]
+    summary = pd.DataFrame(summary_rows)
 
     st.subheader("Resilience diagnostics")
     st.caption(
-        f"Rolling window: {diagnostic_window} steps, calculated from Δ{_response_axis_label(response_var)} trajectories."
+        f"Variance/autocorrelation rolling window: {indicator_window} steps. "
+        f"MK trend diagnostics use a {diagnostic_window}-step rolling window."
     )
     colors = _trajectory_colors(trajectory_count)
     time = np.arange(trajectory_steps)
+    trajectory_names = list(trajectory_display_names)
+    shared_environment_series = np.asarray(trajectory_values[0], dtype=float)
+    environment_trend_stats = kendall_mann_trend_results(
+        np.asarray([shared_environment_series], dtype=float),
+        time,
+        trajectory_names=[predictor_axis_label],
+    )
+    variance_trend_stats = kendall_mann_trend_results(
+        rolling_variance,
+        time,
+        trajectory_names=trajectory_names,
+    )
+    autocorr_trend_stats = kendall_mann_trend_results(
+        rolling_autocorrelation,
+        time,
+        trajectory_names=trajectory_names,
+    )
     if np.isfinite(rolling_variance).any():
         with chart_container[chart_col]:
             st.plotly_chart(
-                    build_resilience_indicator_figure(
-                        time=time,
-                        values=rolling_variance,
-                        trajectory_names=[settings["name"] for settings in trajectory_settings],
-                        title="Rolling variance",
-                        y_title=f"Variance of Δ{_response_axis_label(response_var)}",
-                        colors=colors,
-                        figure_height=diagnostic_height,
-                    ),
+                build_resilience_indicator_figure(
+                    time=time,
+                    values=rolling_variance,
+                    trajectory_names=trajectory_names,
+                    title="Rolling variance",
+                    y_title=f"Variance of Δ{_response_axis_label(response_var)}",
+                    colors=colors,
+                    figure_height=diagnostic_height,
+                    show_zero_line=False,
+                    show_mean_line=False,
+                    trend_stats=variance_trend_stats,
+                    environment_series=shared_environment_series,
+                    environment_name=f"{predictor_axis_label} timeseries",
+                    environment_trend_stats=environment_trend_stats,
+                ),
                 use_container_width=True,
             )
     else:
         st.info("Not enough finite points to calculate rolling variance.")
     if np.isfinite(rolling_autocorrelation).any():
-                with chart_container[chart_col]:
-                    st.plotly_chart(
-                            build_resilience_indicator_figure(
-                                time=time,
-                                values=rolling_autocorrelation,
-                                trajectory_names=[settings["name"] for settings in trajectory_settings],
-                                title="Rolling lag-1 autocorrelation",
-                                y_title=f"Autocorrelation of Δ{_response_axis_label(response_var)}",
-                                colors=colors,
-                                y_range=autocorr_y_range,
-                            figure_height=diagnostic_height,
-                        ),
-                        use_container_width=True,
-                    )
+        with chart_container[chart_col]:
+            st.plotly_chart(
+                build_resilience_indicator_figure(
+                    time=time,
+                    values=rolling_autocorrelation,
+                    trajectory_names=trajectory_names,
+                    title="Rolling lag-1 autocorrelation",
+                    y_title=f"Autocorrelation of Δ{_response_axis_label(response_var)}",
+                    colors=colors,
+                    show_zero_line=False,
+                    show_mean_line=False,
+                    figure_height=diagnostic_height,
+                    trend_stats=autocorr_trend_stats,
+                    environment_series=shared_environment_series,
+                    environment_name=f"{predictor_axis_label} timeseries",
+                    environment_trend_stats=environment_trend_stats,
+                ),
+                use_container_width=True,
+            )
     else:
         st.info("Not enough finite points to calculate rolling autocorrelation.")
 
@@ -2541,9 +3780,14 @@ with st.sidebar:
         else:
             st.caption("No saved comparison curves yet.")
 
-    st.button("Reset all settings to defaults", on_click=reset_all_settings, use_container_width=True)
     with st.expander("Educational notes", expanded=False):
         render_education_page()
+
+    st.button(
+        "Reset all settings to defaults",
+        on_click=reset_all_settings,
+        use_container_width=True,
+    )
 
 # Add advanced constants to current profile
 base_profile = current_profile()
