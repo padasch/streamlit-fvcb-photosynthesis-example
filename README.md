@@ -8,6 +8,12 @@ model response surface:
 - `A_net` vs **T_leaf**
 - `A_net` vs **VPD**
 
+A second view, **Resilience**, simulates fluctuating temperature trajectories and compares:
+
+- moving `A_net` trajectories on the `A_net–T_leaf` plane,
+- trajectory and `A_net` anomalies over time with dual y-axes,
+- trajectory count/length, fluctuation controls (absolute °C or relative %), and animation speed.
+
 You can:
 
 - Change default settings with sliders.
