@@ -2128,6 +2128,30 @@ For the **Lag + drift** tier, each trajectory follows:
         response_anoms,
         diagnostic_window,
     )
+    autocorr_finite = rolling_autocorrelation[np.isfinite(rolling_autocorrelation)]
+    if autocorr_finite.size:
+        autocorr_min = float(np.nanmin(autocorr_finite))
+        autocorr_max = float(np.nanmax(autocorr_finite))
+        autocorr_span = autocorr_max - autocorr_min
+        if autocorr_span == 0.0:
+            pad = max(0.05, abs(autocorr_max) * 0.5) if np.isfinite(autocorr_max) else 0.05
+            if pad == 0.0:
+                pad = 0.05
+            autocorr_min -= pad
+            autocorr_max += pad
+        else:
+            pad = max(0.05, 0.15 * autocorr_span)
+            autocorr_min -= pad
+            autocorr_max += pad
+        if autocorr_min > 0:
+            autocorr_min = -pad
+        if autocorr_max < 0:
+            autocorr_max = pad
+        autocorr_min = max(-1.0, autocorr_min)
+        autocorr_max = min(1.0, autocorr_max)
+        autocorr_y_range = [autocorr_min, autocorr_max]
+    else:
+        autocorr_y_range = [-1.0, 1.0]
 
     st.subheader("Resilience diagnostics")
     st.caption(
@@ -2152,20 +2176,20 @@ For the **Lag + drift** tier, each trajectory follows:
     else:
         st.info("Not enough finite points to calculate rolling variance.")
     if np.isfinite(rolling_autocorrelation).any():
-        with chart_container[chart_col]:
-            st.plotly_chart(
-                    build_resilience_indicator_figure(
-                        time=time,
-                        values=rolling_autocorrelation,
-                        trajectory_names=[settings["name"] for settings in trajectory_settings],
-                        title="Rolling lag-1 autocorrelation",
-                        y_title=f"Autocorrelation of Δ{_response_axis_label(response_var)}",
-                        colors=colors,
-                        y_range=[-1.0, 1.0],
-                    figure_height=diagnostic_height,
-                ),
-                use_container_width=True,
-            )
+                with chart_container[chart_col]:
+                    st.plotly_chart(
+                            build_resilience_indicator_figure(
+                                time=time,
+                                values=rolling_autocorrelation,
+                                trajectory_names=[settings["name"] for settings in trajectory_settings],
+                                title="Rolling lag-1 autocorrelation",
+                                y_title=f"Autocorrelation of Δ{_response_axis_label(response_var)}",
+                                colors=colors,
+                                y_range=autocorr_y_range,
+                            figure_height=diagnostic_height,
+                        ),
+                        use_container_width=True,
+                    )
     else:
         st.info("Not enough finite points to calculate rolling autocorrelation.")
 
