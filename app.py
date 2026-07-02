@@ -872,6 +872,7 @@ def reset_all_settings():
         "ko25": 278000.0,
         "o2": 210000.0,
         "resilience_lag_default_steps": 0,
+        "resilience_model_tier": "Basic",
         "resilience_trajectory_name_0": "Healthy",
         "resilience_trajectory_name_1": "Stressed",
         "resilience_trajectory_name_2": "Trajectory 3",
@@ -879,6 +880,47 @@ def reset_all_settings():
         "resilience_trajectory_name_4": "Trajectory 5",
         "resilience_trajectory_name_5": "Trajectory 6",
     }
+    for trajectory_idx in range(6):
+        defaults[f"resilience_lag_{PREDICTOR_OPTIONS[0]}_{trajectory_idx}"] = 0
+        defaults[f"resilience_lag_{PREDICTOR_OPTIONS[1]}_{trajectory_idx}"] = 0
+        defaults[f"resilience_lag_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = 0
+        defaults[f"resilience_lag_{PREDICTOR_OPTIONS[3]}_{trajectory_idx}"] = 0
+        defaults[f"resilience_mean_{PREDICTOR_OPTIONS[0]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[0], trajectory_idx
+        )
+        defaults[f"resilience_mean_{PREDICTOR_OPTIONS[1]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[1], trajectory_idx
+        )
+        defaults[f"resilience_mean_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[2], trajectory_idx
+        )
+        defaults[f"resilience_mean_{PREDICTOR_OPTIONS[3]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[3], trajectory_idx
+        )
+        defaults[f"resilience_drift_start_{PREDICTOR_OPTIONS[0]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[0], trajectory_idx
+        )
+        defaults[f"resilience_drift_end_{PREDICTOR_OPTIONS[0]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[0], trajectory_idx
+        )
+        defaults[f"resilience_drift_start_{PREDICTOR_OPTIONS[1]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[1], trajectory_idx
+        )
+        defaults[f"resilience_drift_end_{PREDICTOR_OPTIONS[1]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[1], trajectory_idx
+        )
+        defaults[f"resilience_drift_start_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[2], trajectory_idx
+        )
+        defaults[f"resilience_drift_end_{PREDICTOR_OPTIONS[2]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[2], trajectory_idx
+        )
+        defaults[f"resilience_drift_start_{PREDICTOR_OPTIONS[3]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[3], trajectory_idx
+        )
+        defaults[f"resilience_drift_end_{PREDICTOR_OPTIONS[3]}_{trajectory_idx}"] = _default_trajectory_mean(
+            PREDICTOR_OPTIONS[3], trajectory_idx
+        )
     for key, value in defaults.items():
         st.session_state[key] = value
 
@@ -1518,6 +1560,12 @@ def render_resilience_page():
         st.session_state["resilience_predictor"] = "T_leaf"
     if st.session_state.get("resilience_response_var") not in RESPONSE_OPTIONS:
         st.session_state["resilience_response_var"] = "A_net"
+    resilience_tier_options = ["Basic", "Lag response", "Lag + drift"]
+    if st.session_state.get("resilience_model_tier") not in resilience_tier_options:
+        st.session_state["resilience_model_tier"] = "Basic"
+    resilience_tier = st.session_state.get("resilience_model_tier", "Basic")
+    enable_lag = resilience_tier != "Basic"
+    enable_drift = resilience_tier == "Lag + drift"
 
     trajectory_count = int(st.session_state.get("resilience_trajectory_count", 2))
     trajectory_steps = int(st.session_state.get("resilience_trajectory_steps", 120))
@@ -1549,7 +1597,11 @@ def render_resilience_page():
                 """
 ### Resilience simulation
 
-- A common, shared environmental anomaly is generated once (mean-reverting random walk) and added to each trajectory mean.
+- Three modeling tiers are available:
+  - **Basic**: shared anomaly + shared model settings, no post-processing response lag.
+  - **Lag response**: optional first-order response lag is added after model evaluation.
+  - **Lag + drift**: linear trajectory drift is added between a start and final predictor value, plus response lag.
+- A common, shared environmental anomaly is generated once (mean-reverting random walk) and added to each trajectory base path.
 - Each trajectory is evaluated through the same FvCB evaluator used in the photosynthesis tab, with all non-target parameters held fixed.
 - Baseline response is computed at each trajectory mean.
 - Trajectory anomalies are shown as:
@@ -1568,6 +1620,11 @@ def render_resilience_page():
   where `k = 0` is immediate response and larger values produce slower response.
 
 Higher lag values smooth and delay response to forcing, while all other model physics and diagnostics remain unchanged.
+
+For the **Lag + drift** tier, each trajectory follows:
+
+- `predictor(t) = drift_start + (drift_end - drift_start) * (t / (T-1))`
+- Shared anomalies from the random walk are added afterward.
                 """
             )
         with st.expander("Visual settings", expanded=False):
@@ -1598,6 +1655,11 @@ Higher lag values smooth and delay response to forcing, while all other model ph
             diagnostic_height = int(max(260, min(680, round(display_height * 0.45))))
 
         with st.expander("Curve setup", expanded=False):
+            resilience_tier = st.selectbox(
+                "Resilience model tier",
+                options=resilience_tier_options,
+                key="resilience_model_tier",
+            )
             response_var = st.selectbox(
                 "Target (y-axis)",
                 options=RESPONSE_OPTIONS,
@@ -1637,6 +1699,11 @@ Higher lag values smooth and delay response to forcing, while all other model ph
                     placeholder="e.g., Healthy",
                 )
                 st.markdown(f"**{trajectory_name or _default_trajectory_name(idx)} settings**")
+                st.caption(
+                    "In **Lag response**, this controls how slowly the response follows forcing."
+                    if enable_lag
+                    else "Lag is not used in the Basic tier."
+                )
                 mean_value = st.slider(
                     f"Mean {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
                     min_value=float(predictor_config["min"]),
@@ -1645,21 +1712,48 @@ Higher lag values smooth and delay response to forcing, while all other model ph
                     step=float(predictor_config["step"]),
                     key=f"resilience_mean_{predictor}_{idx}",
                 )
-                lag_key = f"resilience_lag_{predictor}_{idx}"
-                lag_steps = st.slider(
-                    "Response lag (steps)",
-                    min_value=0,
-                    max_value=60,
-                    value=int(st.session_state.get(lag_key, lag_default_steps)),
-                    step=1,
-                    key=lag_key,
-                    help="0 = immediate; higher values produce a slower response to forcing.",
-                )
+                if enable_drift:
+                    drift_start_key = f"resilience_drift_start_{predictor}_{idx}"
+                    drift_end_key = f"resilience_drift_end_{predictor}_{idx}"
+                    drift_start = st.slider(
+                        f"Start {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                        min_value=float(predictor_config["min"]),
+                        max_value=float(predictor_config["max"]),
+                        value=float(st.session_state.get(drift_start_key, mean_value)),
+                        step=float(predictor_config["step"]),
+                        key=drift_start_key,
+                    )
+                    drift_end = st.slider(
+                        f"Final {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                        min_value=float(predictor_config["min"]),
+                        max_value=float(predictor_config["max"]),
+                        value=float(st.session_state.get(drift_end_key, mean_value)),
+                        step=float(predictor_config["step"]),
+                        key=drift_end_key,
+                    )
+                else:
+                    drift_start = float(st.session_state.get(f"resilience_drift_start_{predictor}_{idx}", mean_value))
+                    drift_end = float(st.session_state.get(f"resilience_drift_end_{predictor}_{idx}", mean_value))
+                if enable_lag:
+                    lag_key = f"resilience_lag_{predictor}_{idx}"
+                    lag_steps = st.slider(
+                        "Response lag (steps)",
+                        min_value=0,
+                        max_value=60,
+                        value=int(st.session_state.get(lag_key, lag_default_steps)),
+                        step=1,
+                        key=lag_key,
+                        help="0 = immediate; higher values produce a slower response to forcing.",
+                    )
+                else:
+                    lag_steps = 0
                 trajectory_settings.append(
                     {
                         "name": trajectory_name.strip() or _default_trajectory_name(idx),
                         "mean_value": mean_value,
                         "lag_steps": lag_steps,
+                        "drift_start": drift_start,
+                        "drift_end": drift_end,
                     }
                 )
 
@@ -1903,8 +1997,21 @@ Higher lag values smooth and delay response to forcing, while all other model ph
         [settings["mean_value"] for settings in trajectory_settings],
         dtype=float,
     )
-    lower_room = float(np.min(trajectory_means - predictor_config["min"]))
-    upper_room = float(np.min(predictor_config["max"] - trajectory_means))
+    if enable_drift:
+        time_axis = np.linspace(0.0, 1.0, trajectory_steps, dtype=float)
+        trajectory_baselines = np.array(
+            [
+                settings["drift_start"]
+                + (settings["drift_end"] - settings["drift_start"]) * time_axis
+                for settings in trajectory_settings
+            ],
+            dtype=float,
+        )
+    else:
+        trajectory_baselines = trajectory_means[:, None] + np.zeros((trajectory_count, trajectory_steps), dtype=float)
+
+    lower_room = float(np.min(trajectory_baselines - predictor_config["min"]))
+    upper_room = float(np.min(predictor_config["max"] - trajectory_baselines))
     shared_anomaly_limit = min(lower_room, upper_room)
     if shared_anomaly_limit <= 0:
         shared_anomaly = np.zeros(trajectory_steps, dtype=float)
@@ -1922,7 +2029,7 @@ Higher lag values smooth and delay response to forcing, while all other model ph
         )[0]
     shared_anomaly = shared_anomaly - np.nanmean(shared_anomaly)
     shared_anomaly_mean = float(np.nanmean(shared_anomaly))
-    trajectory_values = trajectory_means[:, None] + shared_anomaly[None, :]
+    trajectory_values = trajectory_baselines + shared_anomaly[None, :]
     trajectory_response_raw = evaluate_curve_with_response(
         predictor,
         trajectory_values,
@@ -1963,6 +2070,12 @@ Higher lag values smooth and delay response to forcing, while all other model ph
 
     with st.container():
         st.subheader("Trajectory simulation")
+        if enable_drift:
+            st.caption("Tier: **Lag + drift**. Trajectories drift linearly between start and final predictor values.")
+        elif enable_lag:
+            st.caption("Tier: **Lag response**. Trajectories follow shared anomalies with first-order lag.")
+        else:
+            st.caption("Tier: **Basic**. Trajectories are shared-anomaly mean paths without lag or drift.")
         st.caption(
             f"Shared predictor anomaly is mean-centered: average Δ{_predictor_axis_label(predictor)} "
             f"= {shared_anomaly_mean:.4f}."
@@ -1997,6 +2110,8 @@ Higher lag values smooth and delay response to forcing, while all other model ph
                 f"Mean {predictor_axis_label}": trajectory_settings[idx]["mean_value"],
                 f"Shared amplitude ({predictor_config['unit']})": fluctuation_scale,
                 "Shared seed": seed,
+                f"Start {_predictor_axis_label(predictor)}": float(trajectory_settings[idx]["drift_start"]),
+                f"Final {_predictor_axis_label(predictor)}": float(trajectory_settings[idx]["drift_end"]),
                 f"Peak Δ{_predictor_axis_label(predictor)}": float(np.nanmax(np.abs(predictor_anoms[idx]))),
                 f"Final Δ{_predictor_axis_label(predictor)}": float(predictor_anoms[idx, -1]),
                 f"Min Δ{_response_axis_label(response_var)}": float(np.nanmin(response_anoms[idx])),
