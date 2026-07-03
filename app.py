@@ -1179,7 +1179,7 @@ def reset_all_settings():
         "resilience_trajectory_count": 2,
         "resilience_trajectory_steps": 120,
         "resilience_frame_speed_ms": 110,
-        "resilience_auto_update": False,
+        "resilience_auto_update": True,
         "resilience_enable_lag": False,
         "resilience_enable_drift": False,
         "resilience_sim_signature": None,
@@ -1304,7 +1304,7 @@ def build_resilience_animation_figure(
     figure = make_subplots(
         rows=2,
         cols=1,
-        specs=[[{"type": "xy"}], [{"secondary_y": True}]],
+        specs=[[{"type": "xy"}], [{"type": "xy"}]],
         row_heights=[0.56, 0.44],
         vertical_spacing=0.17,
         subplot_titles=(
@@ -1373,11 +1373,10 @@ def build_resilience_animation_figure(
                 mode="lines",
                 name=f"Δ{predictor_label} forcing",
                 line=dict(color="black", width=1.6),
-                showlegend=True,
+                showlegend=False,
             ),
         row=2,
         col=1,
-        secondary_y=False,
     )
     figure.add_trace(
         go.Scatter(
@@ -1394,7 +1393,6 @@ def build_resilience_animation_figure(
         ),
         row=2,
         col=1,
-        secondary_y=False,
     )
     environment_marker_index = len(figure.data) - 1
 
@@ -1413,7 +1411,7 @@ def build_resilience_animation_figure(
                     name=trajectory_name,
                     line=dict(color=segment_color, width=2.2),
                     legendgroup=trajectory_name,
-                    showlegend=(step == max_segment_index),
+                    showlegend=False,
                 ),
                 row=1,
                 col=1,
@@ -1446,7 +1444,6 @@ def build_resilience_animation_figure(
             ),
             row=2,
             col=1,
-            secondary_y=True,
         )
         anet_anom_marker = go.Scatter(
             x=[0],
@@ -1460,9 +1457,47 @@ def build_resilience_animation_figure(
             ),
             showlegend=False,
         )
-        figure.add_trace(anet_anom_marker, row=2, col=1, secondary_y=True)
+        figure.add_trace(anet_anom_marker, row=2, col=1)
         response_marker_index = len(figure.data) - 1
         marker_indexes.append((left_marker_index, response_marker_index))
+
+    figure.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            mode="markers",
+            marker=dict(
+                color="black",
+                size=9,
+                symbol="square",
+            ),
+            name=f"Δ{predictor_label} forcing",
+            showlegend=True,
+            visible="legendonly",
+        ),
+        row=2,
+        col=1,
+    )
+    for idx in range(trajectory_count):
+        color = colors[idx]
+        trajectory_name = trajectory_names[idx]
+        figure.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(
+                    color=color,
+                    size=9,
+                    symbol="square",
+                ),
+                name=trajectory_name,
+                showlegend=True,
+                visible="legendonly",
+            ),
+            row=2,
+            col=1,
+        )
 
     # Pre-compute marker trace indexes for stable frame updates.
 
@@ -1540,10 +1575,18 @@ def build_resilience_animation_figure(
     left_y_values = np.concatenate(
         [np.asarray(baseline_curve_response, dtype=float).ravel(), response_values.ravel()]
     )
+    anomaly_values = np.concatenate(
+        [
+            np.asarray(response_anoms, dtype=float).ravel(),
+            np.asarray(environment_anomaly, dtype=float).ravel(),
+        ]
+    )
     finite_left_x = left_x_values[np.isfinite(left_x_values)]
     finite_left_y = left_y_values[np.isfinite(left_y_values)]
+    finite_anomaly_y = anomaly_values[np.isfinite(anomaly_values)]
     left_x_range = None
     left_y_range = None
+    anomaly_y_range = None
     if finite_left_x.size:
         left_x_range = [float(np.min(finite_left_x)), float(np.max(finite_left_x))]
     if finite_left_y.size:
@@ -1551,6 +1594,11 @@ def build_resilience_animation_figure(
         y_max = float(np.max(finite_left_y))
         y_pad = max((y_max - y_min) * 0.06, 0.5)
         left_y_range = [y_min - y_pad, y_max + y_pad]
+    if finite_anomaly_y.size:
+        y_min = float(np.min(finite_anomaly_y))
+        y_max = float(np.max(finite_anomaly_y))
+        y_pad = max((y_max - y_min) * 0.06, 0.5)
+        anomaly_y_range = [y_min - y_pad, y_max + y_pad]
 
         figure.update_layout(
         height=chart_height,
@@ -1561,21 +1609,19 @@ def build_resilience_animation_figure(
         hovermode=False,
         legend=dict(
             orientation="h",
-            y=1.19,
+            y=-0.24,
             x=0.0,
             xanchor="left",
             yanchor="top",
             traceorder="normal",
-            itemwidth=175,
+            itemwidth=130,
             valign="top",
-            title=dict(
-                text="Legend",
-                font=dict(color="black", size=12),
-            ),
-            font=dict(color="black"),
+            title=dict(text="", font=dict(color="black", size=12)),
+            font=dict(color="black", size=12),
             itemsizing="constant",
+            bgcolor="rgba(255, 255, 255, 0.8)",
         ),
-        margin=dict(l=20, r=30, t=220, b=35),
+        margin=dict(l=20, r=30, t=220, b=170),
         updatemenus=[
             {
                 "type": "buttons",
@@ -1664,7 +1710,8 @@ def build_resilience_animation_figure(
         col=1,
     )
     figure.update_yaxes(
-        title_text=f"Δ{predictor_label}",
+        title_text=f"Anomalies: Δ{predictor_label}, Δ{response_label}",
+        range=anomaly_y_range,
         showgrid=True,
         gridcolor=neutral_grid,
         title_font=dict(color="black", size=14),
@@ -1673,19 +1720,6 @@ def build_resilience_animation_figure(
         linewidth=1.2,
         row=2,
         col=1,
-        secondary_y=False,
-    )
-    figure.update_yaxes(
-        title_text=f"Δ{response_label}",
-        showgrid=False,
-        title_font=dict(color="black", size=14),
-        tickfont=dict(color="black", size=11),
-        linecolor="#111827",
-        linewidth=1.2,
-        row=2,
-        col=1,
-        secondary_y=True,
-        gridcolor=neutral_grid,
     )
     figure.add_hline(
         y=0,
@@ -1695,18 +1729,6 @@ def build_resilience_animation_figure(
         opacity=0.5,
         row=2,
         col=1,
-        secondary_y=False,
-        layer="below",
-    )
-    figure.add_hline(
-        y=0,
-        line_color=DARK_ZERO,
-        line_dash="dot",
-        line_width=1.4,
-        opacity=0.5,
-        row=2,
-        col=1,
-        secondary_y=True,
         layer="below",
     )
     return figure
@@ -2265,10 +2287,10 @@ def render_resilience_page():
             "resilience_lag_steps",
             st.session_state.get("resilience_lag_default_steps", 1),
         )
-    )
+        )
 
     with st.sidebar:
-        resilience_auto_update = st.session_state.get("resilience_auto_update", False)
+        resilience_auto_update = st.session_state.get("resilience_auto_update", True)
         run_resilience_sim = False
         if not resilience_auto_update:
             st.caption("Automatic recalculation is off.")
@@ -2438,7 +2460,7 @@ When **Drift** is enabled, each trajectory follows:
 
             resilience_auto_update = st.toggle(
                 "Auto-update resilience simulation",
-                value=st.session_state.get("resilience_auto_update", False),
+                value=st.session_state.get("resilience_auto_update", True),
                 key="resilience_auto_update",
                 help="When enabled, simulation recomputes continuously as controls change. Disable for click-to-apply behavior.",
             )
@@ -2896,6 +2918,7 @@ When **Drift** is enabled, each trajectory follows:
             "Reset all settings to defaults",
             on_click=reset_all_settings,
             use_container_width=True,
+            type="primary",
             key="resilience_reset_all_settings",
         )
 
@@ -3006,13 +3029,21 @@ When **Drift** is enabled, each trajectory follows:
     cached_payload = st.session_state.get("resilience_sim_cached_payload")
     signature_changed = cached_signature != requested_signature
     should_run_simulation = resilience_auto_update or run_resilience_sim or cached_payload is None
-    if not should_run_simulation and signature_changed:
-        st.info(
-            "Resilience settings changed but live recalculation is disabled. Click **Run resilience simulation** "
-            "to refresh the curves."
-        )
+    if signature_changed:
+        if resilience_auto_update:
+            st.info("Calculating trajectories for the updated settings...")
+        else:
+            st.info(
+                "Resilience settings changed but live recalculation is disabled. Click **Run resilience simulation** "
+                "to refresh the curves."
+            )
     if should_run_simulation:
-        with st.spinner("Running resilience simulation..."):
+        spinner_label = (
+            "Calculating trajectories..."
+            if signature_changed or cached_payload is None
+            else "Running resilience simulation..."
+        )
+        with st.spinner(spinner_label):
             trajectory_means = np.asarray(
                 [settings["mean_value"] for settings in trajectory_settings],
                 dtype=float,
@@ -3305,9 +3336,10 @@ When **Drift** is enabled, each trajectory follows:
             with chart_container[chart_col]:
                 st.plotly_chart(figure, use_container_width=True)
                 st.caption(
-                    f"Anomalies panel: dotted zero baselines at Δ{predictor_axis_label}=0 (left axis) "
-                    f"and Δ{response_axis_label}=0 (right axis); solid shared Δ{predictor_axis_label} forcing; "
-                    f"solid colored Δ{response_axis_label} trajectories with current-state markers."
+                    f"Anomalies panel: common anomaly axis with dotted zero baselines at "
+                    f"Δ{predictor_axis_label}=0 and Δ{response_axis_label}=0; "
+                    f"solid shared Δ{predictor_axis_label} forcing and solid colored Δ{response_axis_label} "
+                    f"trajectories with current-state markers."
                 )
                 if resilience_2d_mode and setpoint_axis is not None and setpoint_curves is not None:
                     secondary_values = np.asarray(
@@ -3787,6 +3819,7 @@ with st.sidebar:
         "Reset all settings to defaults",
         on_click=reset_all_settings,
         use_container_width=True,
+        type="primary",
     )
 
 # Add advanced constants to current profile
