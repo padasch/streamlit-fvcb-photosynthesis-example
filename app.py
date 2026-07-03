@@ -2308,7 +2308,15 @@ def render_resilience_page():
                 primary_values.append(f"{_format_summary_stressor_value(s, _current_predictor)} → {_format_summary_stressor_value(e, _current_predictor)}")
     else:
         if _current_resilience_2d:
-            primary_values = [_format_summary_stressor_value(primary_default, _current_predictor)]
+            primary_values = [
+                _format_summary_stressor_value(v, _current_predictor)
+                for v in _collect_stressor_values(
+                    "resilience_mean",
+                    min(_current_trajectory_count, 2),
+                    primary_default_key,
+                    _current_predictor,
+                )
+            ]
         else:
             primary_values = _collect_stressor_values(
                 "resilience_mean",
@@ -2317,8 +2325,8 @@ def render_resilience_page():
                 _current_predictor,
             )
             primary_values = [_format_summary_stressor_value(v, _current_predictor) for v in primary_values]
-            if _current_trajectory_count > 2:
-                primary_values.append(f"... {_current_trajectory_count-2} more")
+        if _current_trajectory_count > 2:
+            primary_values.append(f"... {_current_trajectory_count-2} more")
 
     if _current_resilience_2d:
         cond_values = []
@@ -2400,9 +2408,9 @@ def render_resilience_page():
     st.markdown(
         f"""
 **Setting summary**
-- Target: {_response_axis_label(_current_response_var)}
-- Fluct stress: {_predictor_axis_label(_current_predictor)} at {", ".join(primary_values)}
-- Confound stressor: {confounding_summary}
+- Response Variable: {_response_axis_label(_current_response_var)}
+- Fluctuating Stressor: {_predictor_axis_label(_current_predictor)} at {", ".join(primary_values)}
+- Confounding Stressor: {confounding_summary}
 - Extra: response lag ({'on' if enable_response_lag else 'off'}), stressor lag ({'on' if enable_disturbance_lag else 'off'}), stressor drift ({'on' if enable_drift else 'off'})
 """
     )
@@ -2435,6 +2443,10 @@ def render_resilience_page():
     default_mean_value = float(
         st.session_state.get(default_mean_key, predictor_config["default"])
     )
+    if resilience_2d_mode:
+        default_mean_value = float(
+            st.session_state.get(f"resilience_mean_{predictor}_0", default_mean_value)
+        )
     fluctuation_scale_mode = st.session_state.get("resilience_fluctuation_mode", "Absolute units")
     fluctuation_scale_pct = int(st.session_state.get("resilience_fluctuation_scale_pct", 5))
     amplitude_key = f"resilience_fluctuation_scale_{predictor}"
@@ -2505,6 +2517,8 @@ def render_resilience_page():
         st.session_state["resilience_2d_mode_initialized"] = True
         st.session_state[f"resilience_condition_{condition_predictor}_0"] = float(first_condition)
         st.session_state[f"resilience_condition_{condition_predictor}_1"] = float(second_condition)
+        st.session_state[f"resilience_mean_{disturbance_predictor}_0"] = float(primary_mean)
+        st.session_state[f"resilience_mean_{disturbance_predictor}_1"] = float(primary_mean)
         st.session_state[f"resilience_default_mean_{disturbance_predictor}"] = float(
             primary_mean
         )
@@ -2838,12 +2852,12 @@ When **Stressor drift** is enabled, each trajectory follows:
                 args=("T_leaf", "PAR", 300.0, 900.0, True, False, False, 30.0),
             )
             st.button(
-                "Fluctuating Stressor: PAR at 1200\nConfounding Stressor: Tleaf at 25 and 35",
+                "Fluctuating Stressor: PAR at 1200\nConfounding Stressor: Tleaf at 25 and 30",
                 key="resilience_preset_par_1200_tleaf_25_35_2d",
                 use_container_width=True,
                 help="Common primary mean and stressor fluctuations with T_leaf confounding.",
                 on_click=_apply_resilience_preset,
-                args=("PAR", "T_leaf", 25.0, 35.0, False, False, False, 1200.0),
+                args=("PAR", "T_leaf", 25.0, 30.0, False, False, False, 1200.0),
             )
             st.button(
                 "Fluctuating Stressor: Tleaf at 20 and 30 °C\nConfounding Stressor: PAR at 300 and 900",
@@ -2931,14 +2945,22 @@ When **Stressor drift** is enabled, each trajectory follows:
 
             default_mean_key = f"resilience_default_mean_{predictor}"
             default_mean_value = float(st.session_state.get(default_mean_key, predictor_config["default"]))
-            default_mean_value = st.slider(
-                f"Mean {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
-                min_value=float(predictor_config["min"]),
-                max_value=float(predictor_config["max"]),
-                value=default_mean_value,
-                step=float(predictor_config["step"]),
-                key=default_mean_key,
-            )
+            if resilience_2d_mode:
+                default_mean_value = float(
+                    st.session_state.get(
+                        f"resilience_mean_{predictor}_0",
+                        default_mean_value,
+                    )
+                )
+            if not resilience_2d_mode:
+                default_mean_value = st.slider(
+                    f"Mean {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                    min_value=float(predictor_config["min"]),
+                    max_value=float(predictor_config["max"]),
+                    value=default_mean_value,
+                    step=float(predictor_config["step"]),
+                    key=default_mean_key,
+                )
 
             st.markdown(
                 "<div class='resilience-setting-heading'>Secondary stressor</div>",
@@ -3079,32 +3101,20 @@ When **Stressor drift** is enabled, each trajectory follows:
                     trajectory_drift_ends.append(
                         float(st.session_state.get(f"resilience_drift_end_{predictor}_{idx}", trajectory_default))
                     )
-                    if resilience_2d_mode:
-                        st.slider(
-                            f"{_predictor_axis_label(predictor)} ({predictor_config['unit']})",
-                            min_value=float(predictor_config["min"]),
-                            max_value=float(predictor_config["max"]),
-                            value=float(default_mean_value),
-                            step=float(predictor_config["step"]),
-                            disabled=True,
-                            key=f"resilience_primary_mean_fixed_{predictor}_{idx}",
-                        )
-                        trajectory_means.append(float(default_mean_value))
-                    else:
-                        mean_value = st.slider(
-                            f"{_predictor_axis_label(predictor)} ({predictor_config['unit']})",
-                            min_value=float(predictor_config["min"]),
-                            max_value=float(predictor_config["max"]),
-                            value=float(
-                                st.session_state.get(
-                                    f"resilience_mean_{predictor}_{idx}",
-                                    trajectory_default,
-                                )
-                            ),
-                            step=float(predictor_config["step"]),
-                            key=f"resilience_mean_{predictor}_{idx}",
-                        )
-                        trajectory_means.append(float(mean_value))
+                    mean_value = st.slider(
+                        f"{_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                        min_value=float(predictor_config["min"]),
+                        max_value=float(predictor_config["max"]),
+                        value=float(
+                            st.session_state.get(
+                                f"resilience_mean_{predictor}_{idx}",
+                                trajectory_default,
+                            )
+                        ),
+                        step=float(predictor_config["step"]),
+                        key=f"resilience_mean_{predictor}_{idx}",
+                    )
+                    trajectory_means.append(float(mean_value))
                 if resilience_2d_mode:
                     secondary_value = float(
                         st.slider(
