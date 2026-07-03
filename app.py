@@ -37,7 +37,8 @@ def _resilience_sim_signature(
     trajectory_steps: int,
     diagnostic_window: int,
     indicator_window: int,
-    enable_lag: bool,
+    enable_response_lag: bool,
+    enable_disturbance_lag: bool,
     enable_drift: bool,
     forcing_white_noise: bool,
     resilience_2d_mode: bool,
@@ -50,6 +51,7 @@ def _resilience_sim_signature(
     seed: int,
     frame_speed_ms: int,
     lag_steps_global: int,
+    disturbance_lag_steps_global: int,
     lag_mode: str,
     lag_reference: float,
     lag_sensitivity: float,
@@ -111,7 +113,8 @@ def _resilience_sim_signature(
         int(diagnostic_window),
         int(indicator_window),
         int(trajectory_steps),
-        int(enable_lag),
+        int(enable_response_lag),
+        int(enable_disturbance_lag),
         int(enable_drift),
         int(bool(forcing_white_noise)),
         int(bool(resilience_2d_mode)),
@@ -122,6 +125,7 @@ def _resilience_sim_signature(
         int(seed),
         int(frame_speed_ms),
         int(lag_steps_global),
+        int(disturbance_lag_steps_global),
         str(lag_mode),
         float(lag_reference),
         float(lag_sensitivity),
@@ -538,6 +542,34 @@ def _default_trajectory_mean(predictor, trajectory_idx):
     }[_normalize_predictor(predictor)]
     value = config["default"] + trajectory_idx * offset
     return float(np.clip(value, config["min"], config["max"]))
+
+
+def _resilience_reference_predictor_value(predictor: str) -> float:
+    """Return non-limiting / reference value for a predictor when treated as fixed background."""
+    predictor = _normalize_predictor(predictor)
+    config = PREDICTOR_CONFIG[predictor]
+    if predictor == "PAR":
+        return float(config["max"])
+    if predictor == "C_i":
+        return float(config["max"])
+    if predictor == "VPD":
+        return float(config["min"])
+    if predictor == "T_leaf":
+        temp_optimum = float(st.session_state.get("temp_optimum_c", config["default"]))
+        return float(np.clip(temp_optimum, config["min"], config["max"]))
+    return float(config["default"])
+
+
+def _apply_resilience_reference_environment(skip_predictors: set[str]) -> None:
+    """Set non-stressor predictors to non-limiting reference values."""
+    normalized_skip = {_normalize_predictor(value) for value in skip_predictors}
+    for predictor_name in PREDICTOR_OPTIONS:
+        normalized_predictor = _normalize_predictor(predictor_name)
+        if normalized_predictor in normalized_skip:
+            continue
+        st.session_state[_predictor_profile_key(normalized_predictor)] = _resilience_reference_predictor_value(
+            normalized_predictor
+        )
 
 
 def _default_trajectory_name(trajectory_idx: int) -> str:
@@ -1166,6 +1198,8 @@ def reset_all_settings():
         "ko25": 278000.0,
         "o2": 210000.0,
         "resilience_lag_steps": 1,
+        "resilience_response_lag_steps": 1,
+        "resilience_disturbance_lag_steps": 0,
         "resilience_lag_default_steps": 1,
         "resilience_lag_mode": "Fixed lag",
         "resilience_lag_sensitivity": 1.0,
@@ -1181,6 +1215,8 @@ def reset_all_settings():
         "resilience_frame_speed_ms": 110,
         "resilience_auto_update": True,
         "resilience_enable_lag": False,
+        "resilience_enable_response_lag": False,
+        "resilience_enable_disturbance_lag": False,
         "resilience_enable_drift": False,
         "resilience_sim_signature": None,
         "resilience_sim_cached_payload": None,
@@ -1304,7 +1340,7 @@ def build_resilience_animation_figure(
     figure = make_subplots(
         rows=2,
         cols=1,
-        specs=[[{"type": "xy"}], [{"type": "xy"}]],
+        specs=[[{"type": "xy"}], [{"type": "xy", "secondary_y": True}]],
         row_heights=[0.56, 0.44],
         vertical_spacing=0.17,
         subplot_titles=(
@@ -1371,12 +1407,13 @@ def build_resilience_animation_figure(
                 x=time,
                 y=environment_anomaly,
                 mode="lines",
-                name=f"Δ{predictor_label} disturbance",
+                name=f"Δ{predictor_label} stressor",
                 line=dict(color="black", width=1.6),
                 showlegend=False,
             ),
         row=2,
         col=1,
+        secondary_y=True,
     )
     figure.add_trace(
         go.Scatter(
@@ -1393,6 +1430,7 @@ def build_resilience_animation_figure(
         ),
         row=2,
         col=1,
+        secondary_y=True,
     )
     environment_marker_index = len(figure.data) - 1
 
@@ -1471,7 +1509,7 @@ def build_resilience_animation_figure(
                 size=9,
                 symbol="square",
             ),
-            name=f"Δ{predictor_label} disturbance",
+            name=f"Δ{predictor_label} stressor",
             showlegend=True,
             visible="legendonly",
         ),
@@ -1575,18 +1613,16 @@ def build_resilience_animation_figure(
     left_y_values = np.concatenate(
         [np.asarray(baseline_curve_response, dtype=float).ravel(), response_values.ravel()]
     )
-    anomaly_values = np.concatenate(
-        [
-            np.asarray(response_anoms, dtype=float).ravel(),
-            np.asarray(environment_anomaly, dtype=float).ravel(),
-        ]
-    )
+    response_anomaly_values = np.asarray(response_anoms, dtype=float).ravel()
+    predictor_anomaly_values = np.asarray(environment_anomaly, dtype=float).ravel()
     finite_left_x = left_x_values[np.isfinite(left_x_values)]
     finite_left_y = left_y_values[np.isfinite(left_y_values)]
-    finite_anomaly_y = anomaly_values[np.isfinite(anomaly_values)]
+    finite_response_anomaly_y = response_anomaly_values[np.isfinite(response_anomaly_values)]
+    finite_predictor_anomaly_y = predictor_anomaly_values[np.isfinite(predictor_anomaly_values)]
     left_x_range = None
     left_y_range = None
-    anomaly_y_range = None
+    response_anomaly_range = None
+    predictor_anomaly_range = None
     if finite_left_x.size:
         left_x_range = [float(np.min(finite_left_x)), float(np.max(finite_left_x))]
     if finite_left_y.size:
@@ -1594,13 +1630,24 @@ def build_resilience_animation_figure(
         y_max = float(np.max(finite_left_y))
         y_pad = max((y_max - y_min) * 0.06, 0.5)
         left_y_range = [y_min - y_pad, y_max + y_pad]
-    if finite_anomaly_y.size:
-        y_min = float(np.min(finite_anomaly_y))
-        y_max = float(np.max(finite_anomaly_y))
-        y_pad = max((y_max - y_min) * 0.06, 0.5)
-        anomaly_y_range = [y_min - y_pad, y_max + y_pad]
+    if finite_response_anomaly_y.size:
+        response_abs_max = float(np.nanmax(np.abs(finite_response_anomaly_y)))
+        if not np.isfinite(response_abs_max) or response_abs_max < 1e-12:
+            response_abs_max = 1.0
+        response_pad = max(response_abs_max * 0.06, 0.5)
+        response_anomaly_range = [-response_abs_max - response_pad, response_abs_max + response_pad]
+    if finite_predictor_anomaly_y.size:
+        predictor_abs_max = float(np.nanmax(np.abs(finite_predictor_anomaly_y)))
+        if not np.isfinite(predictor_abs_max) or predictor_abs_max < 1e-12:
+            predictor_abs_max = 1.0
+        predictor_pad = max(predictor_abs_max * 0.06, 0.5)
+        predictor_anomaly_range = [-predictor_abs_max - predictor_pad, predictor_abs_max + predictor_pad]
+    if response_anomaly_range is None:
+        response_anomaly_range = [-5.0, 5.0]
+    if predictor_anomaly_range is None:
+        predictor_anomaly_range = [-5.0, 5.0]
 
-        figure.update_layout(
+    figure.update_layout(
         height=chart_height,
         template=template,
         paper_bgcolor="#ffffff",
@@ -1710,14 +1757,30 @@ def build_resilience_animation_figure(
         col=1,
     )
     figure.update_yaxes(
-        title_text=f"Anomalies: Δ{predictor_label}, Δ{response_label}",
-        range=anomaly_y_range,
+        title_text=f"Anomalies: Δ{response_label}",
+        range=response_anomaly_range,
         showgrid=True,
         gridcolor=neutral_grid,
         title_font=dict(color="black", size=14),
         tickfont=dict(color="black", size=11),
         linecolor="#111827",
         linewidth=1.2,
+        zeroline=False,
+        secondary_y=False,
+        row=2,
+        col=1,
+    )
+    figure.update_yaxes(
+        title_text=f"Anomalies: Δ{predictor_label}",
+        range=predictor_anomaly_range,
+        showgrid=False,
+        gridcolor=neutral_grid,
+        title_font=dict(color="black", size=14),
+        tickfont=dict(color="black", size=11),
+        linecolor="#111827",
+        linewidth=1.2,
+        zeroline=False,
+        secondary_y=True,
         row=2,
         col=1,
     )
@@ -1827,15 +1890,15 @@ def build_resilience_setpoint_curve_figure(
         paper_bgcolor="#ffffff",
         plot_bgcolor="#ffffff",
         font=dict(color="black", size=12),
-        title=f"Setpoint response curves ({setpoint_label})",
+        title=f"Secondary Stressor ({setpoint_label})",
         title_font=dict(color="black", size=14),
         margin=dict(l=20, r=20, t=55, b=35),
         legend=dict(
-            orientation="h",
-            x=0.0,
-            y=1.15,
+            orientation="v",
+            x=1.02,
+            y=0.5,
             xanchor="left",
-            yanchor="top",
+            yanchor="middle",
             font=dict(color="black", size=11),
             itemsizing="constant",
         ),
@@ -2183,6 +2246,121 @@ def render_resilience_page():
         "against each trajectory's own mean baseline."
     )
 
+    if st.session_state.get("resilience_predictor") not in PREDICTOR_OPTIONS:
+        st.session_state["resilience_predictor"] = "T_leaf"
+    if st.session_state.get("resilience_response_var") not in RESPONSE_OPTIONS:
+        st.session_state["resilience_response_var"] = "A_net"
+
+    _current_predictor = _normalize_predictor(st.session_state.get("resilience_predictor", "T_leaf"))
+    _current_response_var = st.session_state.get("resilience_response_var", "A_net")
+    _current_condition_predictor = _normalize_predictor(
+        st.session_state.get("resilience_condition_predictor", "T_leaf")
+    )
+    _current_resilience_2d = bool(st.session_state.get("resilience_2d_mode", False))
+    _current_trajectory_count = int(st.session_state.get("resilience_trajectory_count", 2))
+    _current_enable_drift = bool(st.session_state.get("resilience_enable_drift", False))
+
+    def _format_summary_stressor_value(value: float, predictor: str) -> str:
+        config = PREDICTOR_CONFIG.get(_normalize_predictor(predictor), None)
+        if config is None:
+            return f"{float(value)}"
+        unit = str(config["unit"])
+        if predictor == "T_leaf":
+            return f"{float(value):.1f} °C"
+        if predictor == "C_i":
+            return f"{float(value):.0f} {unit}"
+        if predictor == "VPD":
+            return f"{float(value):.2f} {unit}"
+        return f"{float(value):.0f} {unit}"
+
+    def _collect_stressor_values(prefix: str, count: int, fallback_key: str, predictor: str) -> list[float]:
+        values: list[float] = []
+        config = PREDICTOR_CONFIG.get(_normalize_predictor(predictor), None)
+        fallback = float(
+            st.session_state.get(fallback_key, config["default"] if config is not None else 0.0)
+        )
+        for idx in range(count):
+            key = f"{prefix}_{predictor}_{idx}"
+            values.append(float(st.session_state.get(key, fallback)))
+        return values
+
+    primary_config = PREDICTOR_CONFIG[_normalize_predictor(_current_predictor)]
+    primary_default_key = f"resilience_default_mean_{_current_predictor}"
+    primary_default = float(st.session_state.get(primary_default_key, primary_config["default"]))
+    if _current_enable_drift:
+        primary_values = []
+        for idx in range(_current_trajectory_count):
+            s = float(
+                st.session_state.get(
+                    f"resilience_drift_start_{_current_predictor}_{idx}",
+                    _default_trajectory_mean(_current_predictor, idx),
+                )
+            )
+            e = float(
+                st.session_state.get(
+                    f"resilience_drift_end_{_current_predictor}_{idx}",
+                    _default_trajectory_mean(_current_predictor, idx),
+                )
+            )
+            if np.isclose(s, e):
+                primary_values.append(_format_summary_stressor_value(s, _current_predictor))
+            else:
+                primary_values.append(f"{_format_summary_stressor_value(s, _current_predictor)} → {_format_summary_stressor_value(e, _current_predictor)}")
+    else:
+        if _current_resilience_2d:
+            primary_values = [_format_summary_stressor_value(primary_default, _current_predictor)]
+        else:
+            primary_values = _collect_stressor_values(
+                "resilience_mean",
+                min(_current_trajectory_count, 2),
+                primary_default_key,
+                _current_predictor,
+            )
+            primary_values = [_format_summary_stressor_value(v, _current_predictor) for v in primary_values]
+            if _current_trajectory_count > 2:
+                primary_values.append(f"... {_current_trajectory_count-2} more")
+
+    if _current_resilience_2d:
+        cond_values = []
+        condition_config = PREDICTOR_CONFIG[_normalize_predictor(_current_condition_predictor)]
+        condition_default_key = f"resilience_condition_{_current_condition_predictor}_0"
+        for idx in range(min(_current_trajectory_count, 2)):
+            cond_values.append(
+                float(
+                    st.session_state.get(
+                        f"resilience_condition_{_current_condition_predictor}_{idx}",
+                        condition_config["default"],
+                    )
+                )
+            )
+        cond_display = ", ".join(_format_summary_stressor_value(v, _current_condition_predictor) for v in cond_values)
+        if _current_trajectory_count > 2:
+            cond_display = f"{cond_display}, ... {_current_trajectory_count-2} more"
+        confounding_summary = f"{_predictor_axis_label(_current_condition_predictor)} at {cond_display}"
+    else:
+        confounding_summary = "off"
+
+    st.markdown(
+        """
+<style>
+[data-testid="stButton"] > button {
+    justify-content: flex-start;
+    text-align: left;
+}
+.resilience-setting-heading {
+    display: inline-block;
+    margin: 0.35rem 0 0.35rem 0;
+    padding: 0.1rem 0.45rem;
+    border-left: 3px solid #4c78a8;
+    color: #4c78a8;
+    font-size: 1.0rem;
+    font-weight: 650;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
     if st.session_state.get("resilience_fluctuation_mode") == "Percent of baseline":
         st.session_state["resilience_fluctuation_mode"] = "Percent of mean"
     if st.session_state.get("resilience_fluctuation_mode") == "Absolute °C":
@@ -2204,17 +2382,46 @@ def render_resilience_page():
         st.session_state["resilience_enable_lag"] = legacy_tier != "Basic"
     if "resilience_enable_drift" not in st.session_state:
         st.session_state["resilience_enable_drift"] = legacy_tier == "Lag + drift"
-    enable_lag = bool(st.session_state.get("resilience_enable_lag", False))
+    if "resilience_enable_response_lag" not in st.session_state:
+        st.session_state["resilience_enable_response_lag"] = bool(
+            st.session_state.get("resilience_enable_lag", legacy_tier != "Basic")
+        )
+    if "resilience_enable_disturbance_lag" not in st.session_state:
+        st.session_state["resilience_enable_disturbance_lag"] = legacy_tier == "Lag + drift"
+    if "resilience_response_lag_steps" not in st.session_state:
+        st.session_state["resilience_response_lag_steps"] = int(
+            st.session_state.get("resilience_lag_steps", st.session_state.get("resilience_lag_default_steps", 1))
+        )
+    if "resilience_disturbance_lag_steps" not in st.session_state:
+        st.session_state["resilience_disturbance_lag_steps"] = 0
     enable_drift = bool(st.session_state.get("resilience_enable_drift", False))
+    enable_response_lag = bool(st.session_state.get("resilience_enable_response_lag", False))
+    enable_disturbance_lag = bool(st.session_state.get("resilience_enable_disturbance_lag", False))
+    st.markdown(
+        f"""
+**Setting summary**
+- Target: {_response_axis_label(_current_response_var)}
+- Fluct stress: {_predictor_axis_label(_current_predictor)} at {", ".join(primary_values)}
+- Confound stressor: {confounding_summary}
+- Extra: response lag ({'on' if enable_response_lag else 'off'}), stressor lag ({'on' if enable_disturbance_lag else 'off'}), stressor drift ({'on' if enable_drift else 'off'})
+"""
+    )
 
     resilience_2d_mode = bool(st.session_state.get("resilience_2d_mode", False))
     resilience_condition_predictor = st.session_state.get("resilience_condition_predictor", "T_leaf")
     if resilience_2d_mode and not st.session_state.get("resilience_2d_mode_initialized", False):
-        st.session_state["resilience_predictor"] = "PAR"
-        resilience_condition_predictor = "T_leaf"
-        st.session_state["resilience_condition_predictor"] = resilience_condition_predictor
-        st.session_state["resilience_condition_T_leaf_0"] = 25.0
-        st.session_state["resilience_condition_T_leaf_1"] = 35.0
+        predictor_for_2d = st.session_state.get("resilience_predictor", PREDICTOR_OPTIONS[0])
+        condition_options = [p for p in PREDICTOR_OPTIONS if p != predictor_for_2d]
+        if not condition_options:
+            condition_options = [PREDICTOR_OPTIONS[0]]
+        resilience_condition_predictor = st.session_state.get("resilience_condition_predictor")
+        if resilience_condition_predictor not in condition_options:
+            resilience_condition_predictor = condition_options[0]
+            st.session_state["resilience_condition_predictor"] = resilience_condition_predictor
+        if f"resilience_condition_{resilience_condition_predictor}_0" not in st.session_state:
+            st.session_state[f"resilience_condition_{resilience_condition_predictor}_0"] = 25.0
+        if f"resilience_condition_{resilience_condition_predictor}_1" not in st.session_state:
+            st.session_state[f"resilience_condition_{resilience_condition_predictor}_1"] = 35.0
         st.session_state["resilience_2d_mode_initialized"] = True
 
     resilience_2d_mode = bool(st.session_state.get("resilience_2d_mode", False))
@@ -2261,17 +2468,83 @@ def render_resilience_page():
         condition_predictor: str,
         first_condition: float,
         second_condition: float,
-        enable_lag: bool = False,
+        enable_response_lag: bool = False,
+        enable_disturbance_lag: bool = False,
         enable_drift: bool = False,
+        primary_mean: float | None = None,
     ) -> None:
+        disturbance_predictor = _normalize_predictor(disturbance_predictor)
+        condition_predictor = _normalize_predictor(condition_predictor)
+        if disturbance_predictor == condition_predictor:
+            for alt_predictor in PREDICTOR_OPTIONS:
+                if alt_predictor != disturbance_predictor:
+                    condition_predictor = alt_predictor
+                    break
+        condition_min = PREDICTOR_CONFIG[condition_predictor]["min"]
+        condition_max = PREDICTOR_CONFIG[condition_predictor]["max"]
+        first_condition = float(np.clip(first_condition, condition_min, condition_max))
+        second_condition = float(np.clip(second_condition, condition_min, condition_max))
+        primary_min = float(PREDICTOR_CONFIG[disturbance_predictor]["min"])
+        primary_max = float(PREDICTOR_CONFIG[disturbance_predictor]["max"])
+        if primary_mean is None:
+            primary_mean = float(
+                np.clip(
+                    st.session_state.get(
+                        f"resilience_default_mean_{disturbance_predictor}",
+                        PREDICTOR_CONFIG[disturbance_predictor]["default"],
+                    ),
+                    primary_min,
+                    primary_max,
+                )
+            )
+        else:
+            primary_mean = float(np.clip(float(primary_mean), primary_min, primary_max))
         st.session_state["resilience_2d_mode"] = True
         st.session_state["resilience_predictor"] = disturbance_predictor
         st.session_state["resilience_condition_predictor"] = condition_predictor
         st.session_state["resilience_2d_mode_initialized"] = True
         st.session_state[f"resilience_condition_{condition_predictor}_0"] = float(first_condition)
         st.session_state[f"resilience_condition_{condition_predictor}_1"] = float(second_condition)
-        st.session_state["resilience_enable_lag"] = bool(enable_lag)
+        st.session_state[f"resilience_default_mean_{disturbance_predictor}"] = float(
+            primary_mean
+        )
+        st.session_state["resilience_enable_response_lag"] = bool(enable_response_lag)
+        st.session_state["resilience_enable_disturbance_lag"] = bool(enable_disturbance_lag)
+        st.session_state["resilience_enable_lag"] = bool(enable_response_lag)
         st.session_state["resilience_enable_drift"] = bool(enable_drift)
+        _apply_resilience_reference_environment({disturbance_predictor, condition_predictor})
+        if st.session_state.get("resilience_trajectory_count", 2) >= 2:
+            st.session_state["resilience_trajectory_name_0"] = "Healthy"
+            st.session_state["resilience_trajectory_name_1"] = "Stressed"
+
+    def _apply_resilience_1d_pair_preset(
+        disturbance_predictor: str,
+        first_mean: float,
+        second_mean: float,
+        enable_response_lag: bool = False,
+        enable_disturbance_lag: bool = False,
+        enable_drift: bool = False,
+    ) -> None:
+        disturbance_predictor = _normalize_predictor(disturbance_predictor)
+        disturbance_min = PREDICTOR_CONFIG[disturbance_predictor]["min"]
+        disturbance_max = PREDICTOR_CONFIG[disturbance_predictor]["max"]
+        first_mean = float(np.clip(first_mean, disturbance_min, disturbance_max))
+        second_mean = float(np.clip(second_mean, disturbance_min, disturbance_max))
+        st.session_state["resilience_2d_mode"] = False
+        st.session_state["resilience_2d_mode_initialized"] = False
+        st.session_state["resilience_predictor"] = disturbance_predictor
+        st.session_state["resilience_response_var"] = "A_net"
+        st.session_state["resilience_enable_response_lag"] = bool(enable_response_lag)
+        st.session_state["resilience_enable_disturbance_lag"] = bool(enable_disturbance_lag)
+        st.session_state["resilience_enable_lag"] = bool(enable_response_lag)
+        st.session_state["resilience_enable_drift"] = bool(enable_drift)
+        st.session_state["resilience_trajectory_count"] = max(2, int(st.session_state.get("resilience_trajectory_count", 2)))
+        st.session_state[f"resilience_mean_{disturbance_predictor}_0"] = float(first_mean)
+        st.session_state[f"resilience_mean_{disturbance_predictor}_1"] = float(second_mean)
+        st.session_state[f"resilience_default_mean_{disturbance_predictor}"] = float(
+            np.mean([float(first_mean), float(second_mean)])
+        )
+        _apply_resilience_reference_environment({disturbance_predictor})
         if st.session_state.get("resilience_trajectory_count", 2) >= 2:
             st.session_state["resilience_trajectory_name_0"] = "Healthy"
             st.session_state["resilience_trajectory_name_1"] = "Stressed"
@@ -2281,6 +2554,7 @@ def render_resilience_page():
         st.session_state["resilience_2d_mode_initialized"] = False
         st.session_state["resilience_predictor"] = "T_leaf"
         st.session_state["resilience_response_var"] = "A_net"
+        _apply_resilience_reference_environment({"T_leaf"})
         if st.session_state.get("resilience_trajectory_count", 2) >= 1:
             st.session_state["resilience_trajectory_name_0"] = "Healthy"
         if st.session_state.get("resilience_trajectory_count", 2) >= 2:
@@ -2288,30 +2562,84 @@ def render_resilience_page():
 
     lag_steps_global = int(
         st.session_state.get(
-            "resilience_lag_steps",
-            st.session_state.get("resilience_lag_default_steps", 1),
+            "resilience_response_lag_steps",
+            st.session_state.get(
+                "resilience_lag_steps",
+                st.session_state.get("resilience_lag_default_steps", 1),
+            ),
         )
+    )
+    disturbance_lag_steps_global = int(
+        st.session_state.get("resilience_disturbance_lag_steps", 0)
+    )
+    lag_reference_key = f"resilience_lag_reference_{predictor}"
+    lag_mode_key = f"resilience_lag_mode_{predictor}"
+    lag_sensitivity_key = f"resilience_lag_sensitivity_{predictor}"
+    lag_reference_default_base = (
+        float(st.session_state.get("temp_optimum_c", 25.0))
+        if predictor == "T_leaf"
+        else float(predictor_config["default"])
+    )
+    lag_mode = st.session_state.get(
+        lag_mode_key,
+        st.session_state.get("resilience_lag_mode", "Fixed lag"),
+    )
+    lag_reference = float(
+        st.session_state.get(
+            lag_reference_key,
+            st.session_state.get(
+                f"resilience_lag_reference_{predictor}_0",
+                lag_reference_default_base,
+            ),
         )
+    )
+    lag_sensitivity = float(
+        st.session_state.get(
+            lag_sensitivity_key,
+            st.session_state.get(
+                f"resilience_lag_sensitivity_{predictor}_0",
+                float(st.session_state.get("resilience_lag_sensitivity", 1.0)),
+            ),
+        )
+    )
 
     with st.sidebar:
-        st.markdown("### General description")
+        resilience_auto_update = st.toggle(
+            "Auto-update resilience simulation",
+            value=st.session_state.get("resilience_auto_update", True),
+            key="resilience_auto_update",
+            help="When enabled, simulation recomputes continuously as controls change. Disable for click-to-apply behavior.",
+        )
+        run_resilience_sim = False
+        if not resilience_auto_update:
+            st.caption("Automatic recalculation is off.")
+            run_resilience_sim = st.button(
+                "Run resilience simulation",
+                key="resilience_run_simulation",
+                use_container_width=True,
+                type="primary",
+                help="Apply current resilience settings and refresh charts.",
+            )
 
-        with st.expander("Model description", expanded=False):
+        with st.expander("Description", expanded=False):
             st.markdown(
                 """
 ### Resilience simulation
 
-- Two optional model effects are available:
-  - **Lag**: first-order response lag is applied after model evaluation.
-  - **Drift**: each trajectory follows a predictor trajectory that drifts linearly from start to final value.
-  - A common, shared environmental anomaly is generated once and then added to each trajectory base path.
-  - The default disturbance mode is white noise (independent shocks, no memory). Optionally switch to mean-reverting disturbance for persistent trajectories.
+- Four optional mechanisms are available:
+  - **Response lag**: first-order response lag is applied after model evaluation.
+  - **Stressor lag**: lag is applied to the shared stressor time series before it is added to trajectory means.
+  - **Stressor drift**: each trajectory follows a predictor trajectory that drifts linearly from start to final value.
+  - **Confounding stressor**: a second fixed predictor is used per trajectory while the primary stressor fluctuates.
+  - A common, shared stressor anomaly is generated once and then added to each trajectory base path.
+  - The default stressor mode is white noise (independent shocks, no memory). Optionally switch to mean-reverting stressors for persistent trajectories.
 - Each trajectory is evaluated through the same FvCB evaluator used in the photosynthesis tab, with all non-target parameters held fixed.
 - Baseline response is computed at each trajectory mean.
 - Trajectory anomalies are shown as:
   `response_anomaly[t] = lagged_response[t] - baseline_response`
 
- - Optional lag (`Response lag`) is applied **after** model evaluation using shared lag settings for all trajectories.
+- Optional **Response lag** (`k`) is applied **after** model evaluation using shared response lag settings.
+- Optional **Stressor lag** (`k`) is applied to the shared stressor before baseline addition.
 
   For lag steps `k`, the exponential smoothing is:
 
@@ -2323,16 +2651,15 @@ def render_resilience_page():
 
   where `k = 0` is immediate response and larger values produce slower response.
 
-Higher lag values smooth and delay response to disturbance, while all other model physics and diagnostics remain unchanged.
+Higher lag values smooth and delay response to stressors, while all other model physics and diagnostics remain unchanged.
 
-When **Drift** is enabled, each trajectory follows:
+When **Stressor drift** is enabled, each trajectory follows:
 
 - `predictor(t) = drift_start + (drift_end - drift_start) * (t / (T-1))`
-- Shared anomalies are added afterward based on the selected disturbance mode.
+- Shared anomalies are added afterward based on the selected stressor mode.
                 """
             )
 
-        st.markdown("### Visual settings")
         with st.expander("Visual settings", expanded=False):
             width = st.session_state.get("display_width", 75)
             if not (0 <= width <= 100):
@@ -2356,6 +2683,15 @@ When **Drift** is enabled, each trajectory follows:
                 step=50,
                 key="display_height",
                 help="Controls the overall height scale of the resilience plots.",
+            )
+            seed = st.number_input(
+                "Random seed",
+                min_value=0,
+                max_value=999999,
+                value=seed,
+                step=1,
+                key="resilience_seed",
+                help="Controls reproducibility of stressor time series.",
             )
             trajectory_count = st.slider(
                 "Number of trajectories",
@@ -2384,461 +2720,162 @@ When **Drift** is enabled, each trajectory follows:
             animation_height = int(min(1800, max(450, round(display_height * 1.5))))
             diagnostic_height = int(max(320, min(720, round(display_height * 0.52))))
 
-        st.markdown("### Mechanisms")
-        with st.expander("Simulation toggles", expanded=False):
-            resilience_auto_update = st.session_state.get("resilience_auto_update", True)
-            run_resilience_sim = False
-            if not resilience_auto_update:
-                st.caption("Automatic recalculation is off.")
-                run_resilience_sim = st.button(
-                    "Run resilience simulation",
-                    key="resilience_run_simulation",
-                    use_container_width=True,
-                    type="primary",
-                    help="Apply current resilience settings and refresh charts.",
-                )
-            resilience_auto_update = st.toggle(
-                "Auto-update resilience simulation",
-                value=st.session_state.get("resilience_auto_update", True),
-                key="resilience_auto_update",
-                help="When enabled, simulation recomputes continuously as controls change. Disable for click-to-apply behavior.",
-            )
-            enable_lag = st.toggle(
-                "Enable lag",
-                value=enable_lag,
-                key="resilience_enable_lag",
+        with st.expander("Mechanisms", expanded=False):
+            enable_response_lag = st.toggle(
+                "Response lag",
+                value=enable_response_lag,
+                key="resilience_enable_response_lag",
                 help="Adds post-processing response lag to each trajectory.",
             )
+            enable_disturbance_lag = st.toggle(
+                "Stressor lag",
+                value=enable_disturbance_lag,
+                key="resilience_enable_disturbance_lag",
+                help="Adds lag/smoothing to the shared stressor forcing before it is applied.",
+            )
             enable_drift = st.toggle(
-                "Enable drift",
+                "Stressor drift",
                 value=enable_drift,
                 key="resilience_enable_drift",
                 help="Adds a linear start-to-final drift to each trajectory baseline.",
             )
-
-        st.markdown("### Presets")
-        st.markdown(
-            "<div style=\"background:#e9f1ff;border:1px solid #9fbff2;border-radius:8px;padding:6px 10px;"
-            "margin:2px 0;color:#102a63;\"><strong>Preset scenarios</strong> (disturbance setups)</div>",
-            unsafe_allow_html=True,
-        )
-        with st.expander("Quick presets", expanded=False):
-            st.markdown("#### Tleaf fluctuation presets")
-            preset_col_1, preset_col_2 = st.columns(2)
-            with preset_col_1:
-                st.button(
-                    "Tleaf fluctuations @ 25 and 35 °C",
-                    key="resilience_preset_tleaf_25_35",
-                    use_container_width=True,
-                    help="Shared T_leaf disturbance with setpoint temperatures 25 °C and 35 °C.",
-                    on_click=_apply_resilience_preset,
-                    args=("T_leaf", "PAR", 25.0, 35.0, False, False),
-                )
-                st.button(
-                    "Tleaf fluctuations @ 25 and 35 °C + lag",
-                    key="resilience_preset_tleaf_25_35_lag",
-                    use_container_width=True,
-                    help="As above, with response lag enabled.",
-                    on_click=_apply_resilience_preset,
-                    args=("T_leaf", "PAR", 25.0, 35.0, True, False),
-                )
-                st.button(
-                    "Tleaf fluctuations @ 25 and 35 °C + lag + drift",
-                    key="resilience_preset_tleaf_25_35_lag_drift",
-                    use_container_width=True,
-                    help="As above, with lag and drift enabled.",
-                    on_click=_apply_resilience_preset,
-                    args=("T_leaf", "PAR", 25.0, 35.0, True, True),
-                )
-            with preset_col_2:
-                st.button(
-                    "Light intensity fluctuations @ 300 and 900",
-                    key="resilience_preset_par_300_900",
-                    use_container_width=True,
-                    help="Shared PAR disturbance with trajectory setpoints 300 and 900.",
-                    on_click=_apply_resilience_preset,
-                    args=("PAR", "T_leaf", 300.0, 900.0, False, False),
-                )
-                st.button(
-                    "Light intensity fluctuations @ 300 and 900 + lag",
-                    key="resilience_preset_par_300_900_lag",
-                    use_container_width=True,
-                    help="As above, with response lag enabled.",
-                    on_click=_apply_resilience_preset,
-                    args=("PAR", "T_leaf", 300.0, 900.0, True, False),
-                )
-                st.button(
-                    "Light intensity fluctuations @ 300 and 900 + lag + drift",
-                    key="resilience_preset_par_300_900_lag_drift",
-                    use_container_width=True,
-                    help="As above, with lag and drift enabled.",
-                    on_click=_apply_resilience_preset,
-                    args=("PAR", "T_leaf", 300.0, 900.0, True, True),
-                )
-
-            st.button(
-                "1D: Shared disturbance only",
-                key="resilience_preset_default_1d",
-                use_container_width=True,
-                help="Return to 2D mode off with shared disturbance (no trajectory conditioning).",
-                on_click=_apply_resilience_1d_preset,
+            resilience_2d_mode = st.toggle(
+                "Add confounding stressor",
+                value=resilience_2d_mode,
+                key="resilience_2d_mode",
+                help=(
+                    "Use one shared stressor trajectory, while each trajectory has a "
+                    "different fixed value for a confounding stressor."
+                ),
             )
 
-        st.markdown("### Target")
-        with st.expander("Setup - Target", expanded=False):
+            st.session_state["resilience_enable_lag"] = bool(enable_response_lag)
+
+        with st.expander("Quick presets", expanded=False):
+            st.markdown("<div class='resilience-setting-heading'>Single stressor</div>", unsafe_allow_html=True)
+            st.button(
+                "Fluctuating Stressor:\nTleaf at 25 and 35 °C",
+                key="resilience_preset_tleaf_25_35_1d",
+                use_container_width=True,
+                help=(
+                    "Single stressor setup with two trajectories at 25 °C and 35 °C, "
+                    "sharing the same temperature stressor trajectory."
+                ),
+                on_click=_apply_resilience_1d_pair_preset,
+                args=("T_leaf", 25.0, 35.0, False, False, False),
+            )
+            st.button(
+                "Fluctuating Stressor:\nTleaf at 25 and 35 °C + response lag (response)",
+                key="resilience_preset_tleaf_25_35_1d_lag",
+                use_container_width=True,
+                help=(
+                    "Single stressor setup with **response lag** enabled (shared forcing, delayed response). "
+                    "Stressor lag is still off."
+                ),
+                on_click=_apply_resilience_1d_pair_preset,
+                args=("T_leaf", 25.0, 35.0, True, False, False),
+            )
+            st.button(
+                "Fluctuating Stressor:\nTleaf at 25 and 35 °C + response lag (response) + drift",
+                key="resilience_preset_tleaf_25_35_1d_lag_drift",
+                use_container_width=True,
+                help=(
+                    "Single stressor setup with **response lag** enabled and stressor means drifting. "
+                    "Stressor lag is still off."
+                ),
+                on_click=_apply_resilience_1d_pair_preset,
+                args=("T_leaf", 25.0, 35.0, True, False, True),
+            )
+            st.button(
+                "Fluctuating Stressor:\nPAR at 300 and 900",
+                key="resilience_preset_par_300_900_1d",
+                use_container_width=True,
+                help=(
+                    "Single stressor setup with two trajectories at 300 and 900 μmol m⁻² s⁻¹ PAR, "
+                    "sharing the same PAR stressor trajectory."
+                ),
+                on_click=_apply_resilience_1d_pair_preset,
+                args=("PAR", 300.0, 900.0, False, False, False),
+            )
+            st.button(
+                "Fluctuating Stressor:\nPAR at 300 and 900 + response lag (response)",
+                key="resilience_preset_par_300_900_1d_lag",
+                use_container_width=True,
+                help=(
+                    "Single stressor setup with **response lag** enabled (shared forcing, delayed response). "
+                    "Stressor lag is still off."
+                ),
+                on_click=_apply_resilience_1d_pair_preset,
+                args=("PAR", 300.0, 900.0, True, False, False),
+            )
+            st.button(
+                "Fluctuating Stressor:\nPAR at 300 and 900 + response lag (response) + drift",
+                key="resilience_preset_par_300_900_1d_lag_drift",
+                use_container_width=True,
+                help=(
+                    "Single stressor setup with **response lag** enabled and stressor means drifting. "
+                    "Stressor lag is still off."
+                ),
+                on_click=_apply_resilience_1d_pair_preset,
+                args=("PAR", 300.0, 900.0, True, False, True),
+            )
+
+            st.markdown("<div class='resilience-setting-heading'>Double stressor</div>", unsafe_allow_html=True)
+            st.button(
+                "Fluctuating Stressor: Tleaf at 30 °C\nConfounding Stressor: PAR at 300 and 900",
+                key="resilience_preset_tleaf_30_par_300_900_2d",
+                use_container_width=True,
+                help="Common primary mean and stressor fluctuations with PAR confounding.",
+                on_click=_apply_resilience_preset,
+                args=("T_leaf", "PAR", 300.0, 900.0, False, False, False, 30.0),
+            )
+            st.button(
+                "Fluctuating Stressor: Tleaf at 30 °C\nConfounding Stressor: PAR at 300 and 900\n+ response lag (response)",
+                key="resilience_preset_tleaf_30_par_300_900_2d_lag",
+                use_container_width=True,
+                help="Common primary mean and stressor fluctuations with **response lag** enabled; stressor lag is off.",
+                on_click=_apply_resilience_preset,
+                args=("T_leaf", "PAR", 300.0, 900.0, True, False, False, 30.0),
+            )
+            st.button(
+                "Fluctuating Stressor: PAR at 1200\nConfounding Stressor: Tleaf at 25 and 35",
+                key="resilience_preset_par_1200_tleaf_25_35_2d",
+                use_container_width=True,
+                help="Common primary mean and stressor fluctuations with T_leaf confounding.",
+                on_click=_apply_resilience_preset,
+                args=("PAR", "T_leaf", 25.0, 35.0, False, False, False, 1200.0),
+            )
+            st.button(
+                "Fluctuating Stressor: Tleaf at 20 and 30 °C\nConfounding Stressor: PAR at 300 and 900",
+                key="resilience_preset_tleaf_20_30_par_300_900_2d",
+                use_container_width=True,
+                help=(
+                    "Common primary mean and stressor fluctuations with confounding PAR. "
+                    "Primary mean set to 25 °C (between the two trajectory settings)."
+                ),
+                on_click=_apply_resilience_preset,
+                args=("T_leaf", "PAR", 300.0, 900.0, False, False, False, 25.0),
+            )
+
+        with st.expander("Response", expanded=False):
             response_var = st.selectbox(
                 "Target (y-axis)",
                 options=RESPONSE_OPTIONS,
                 key="resilience_response_var",
                 format_func=_response_axis_label,
             )
-
-        st.markdown("### Disturbance")
-        with st.expander("Setup - Disturbance", expanded=False):
-            predictor = st.selectbox(
-                "Disturbance predictor (x-axis)",
-                options=PREDICTOR_OPTIONS,
-                key="resilience_predictor",
-                format_func=_predictor_axis_label,
-            )
-            predictor = _normalize_predictor(predictor)
-            predictor_config = PREDICTOR_CONFIG[predictor]
-
-            default_mean_key = f"resilience_default_mean_{predictor}"
-            default_mean_value = float(
-                st.session_state.get(default_mean_key, predictor_config["default"])
-            )
-            default_mean_value = st.slider(
-                f"Reference mean {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
-                min_value=float(predictor_config["min"]),
-                max_value=float(predictor_config["max"]),
-                value=default_mean_value,
-                step=float(predictor_config["step"]),
-                key=default_mean_key,
-                help="Shared baseline value for the disturbance predictor before perturbations are added.",
-            )
-
-            st.caption(
-                "This shared setpoint anchors all trajectories on the disturbance axis. "
-                "Individual trajectory setpoints are configured per trajectory in the setpoint section."
-            )
-
-        with st.expander("Setup - Setpoint", expanded=False):
-            resilience_2d_mode = st.toggle(
-                "2D resilience",
-                value=resilience_2d_mode,
-                key="resilience_2d_mode",
-                help=(
-                    "Use one shared disturbance predictor trajectory, while each trajectory has a "
-                    "different fixed value for a second conditioning predictor."
-                ),
-            )
-            if resilience_2d_mode:
-                if not st.session_state.get("resilience_2d_mode_initialized", False):
-                    st.session_state["resilience_predictor"] = "PAR"
-                    predictor = "PAR"
-                    predictor_config = PREDICTOR_CONFIG[predictor]
-                    resilience_condition_predictor = "T_leaf"
-                    st.session_state["resilience_condition_predictor"] = resilience_condition_predictor
-                    st.session_state["resilience_condition_T_leaf_0"] = 25.0
-                    st.session_state["resilience_condition_T_leaf_1"] = 35.0
-                    st.session_state["resilience_2d_mode_initialized"] = True
-                condition_options = [p for p in PREDICTOR_OPTIONS if p != predictor]
-                if resilience_condition_predictor not in condition_options:
-                    resilience_condition_predictor = condition_options[0]
-                    st.session_state["resilience_condition_predictor"] = resilience_condition_predictor
-                resilience_condition_predictor = st.selectbox(
-                    "Conditioning predictor (static)",
-                    options=condition_options,
-                    key="resilience_condition_predictor",
-                    format_func=_predictor_axis_label,
-                )
-                resilience_condition_predictor = _normalize_predictor(resilience_condition_predictor)
-            else:
-                st.session_state["resilience_2d_mode_initialized"] = False
-                resilience_condition_predictor = st.session_state.get("resilience_condition_predictor", "T_leaf")
-
-        with st.expander("Disturbance statistics", expanded=False):
-            amplitude_key = f"resilience_fluctuation_scale_{predictor}"
-            fluctuation_scale_mode = st.selectbox(
-                "Fluctuation scale",
-                ["Absolute units", "Percent of mean"],
-                index=0 if fluctuation_scale_mode == "Absolute units" else 1,
-                key="resilience_fluctuation_mode",
-            )
-            if fluctuation_scale_mode == "Absolute units":
-                fluctuation_scale = st.slider(
-                    f"Default fluctuation amplitude ({predictor_config['unit']})",
-                    min_value=float(predictor_config["step"]),
-                    max_value=float((predictor_config["max"] - predictor_config["min"]) / 2.0),
-                    value=float(st.session_state.get(amplitude_key, predictor_config["amplitude"])),
-                    step=float(predictor_config["step"]),
-                    key=amplitude_key,
-                )
-            else:
-                fluctuation_scale_pct = st.slider(
-                    "Fluctuation (% of mean)",
-                    min_value=1,
-                    max_value=30,
-                    value=fluctuation_scale_pct,
-                    step=1,
-                    key="resilience_fluctuation_scale_pct",
-                )
-                fluctuation_scale = default_mean_value * (fluctuation_scale_pct / 100.0)
-                st.caption(
-                    f"Default effective amplitude: {fluctuation_scale:.2f} {predictor_config['unit']}"
-                )
-            forcing_mode = st.selectbox(
-                "Environmental disturbance memory",
-                options=["white", "mean_reverting"],
-                format_func=lambda value: "White noise (no memory)"
-                if value == "white"
-                else "Mean-reverting random walk",
-                index=0 if forcing_mode == "white" else 1,
-                key="resilience_forcing_mode",
-                help="White noise produces independent disturbance shocks each step; mean-reverting introduces persistence.",
-            )
-            forcing_white_noise = forcing_mode == "white"
-            mean_reversion = st.slider(
-                "Default mean reversion strength",
-                min_value=0.0,
-                max_value=0.95,
-                value=mean_reversion,
-                step=0.05,
-                key="resilience_mean_reversion",
-                disabled=forcing_white_noise,
-            )
-            step_factor = st.slider(
-                "Default trajectory roughness",
-                min_value=0.2,
-                max_value=1.4,
-                value=step_factor,
-                step=0.05,
-                key="resilience_step_factor",
-                disabled=forcing_white_noise,
-            )
-            if forcing_white_noise:
-                st.caption(
-                    "Disturbance memory is off by default: predictor anomaly has no autocorrelation by construction."
-                )
-            seed = st.number_input(
-                "Default random seed",
-                min_value=0,
-                max_value=999999,
-                value=seed,
-                step=1,
-                key="resilience_seed",
-            )
-
-        st.markdown("### Resilience")
-        with st.expander("Resilience indicators", expanded=False):
-            indicator_window = st.slider(
-                "Variance/autocorrelation rolling window (steps)",
-                min_value=5,
-                max_value=max(5, trajectory_steps),
-                value=min(indicator_window, max(5, trajectory_steps)),
-                step=1,
-                key="resilience_indicator_window",
-                help=(
-                    "Window size used for rolling variance and rolling autocorrelation calculations."
-                ),
-            )
-            diagnostic_window = st.slider(
-                "MK test rolling window (steps)",
-                min_value=5,
-                max_value=max(5, trajectory_steps),
-                value=min(diagnostic_window, max(5, trajectory_steps)),
-                step=1,
-                key="resilience_diagnostic_window",
-                help=(
-                    "Window size used for rolling series used in the "
-                    "Kendall-Mann trend diagnostics."
-                ),
-            )
-
-        trajectory_settings = []
-        lag_reference_key = f"resilience_lag_reference_{predictor}"
-        lag_mode_key = f"resilience_lag_mode_{predictor}"
-        lag_sensitivity_key = f"resilience_lag_sensitivity_{predictor}"
-        lag_reference_default_base = (
-            float(st.session_state.get("temp_optimum_c", 25.0))
-            if predictor == "T_leaf"
-            else float(predictor_config["default"])
-        )
-        lag_steps_global = int(
-            st.session_state.get(
-                "resilience_lag_steps",
-                st.session_state.get("resilience_lag_default_steps", 1),
-            )
-        )
-        lag_mode = st.session_state.get(
-            lag_mode_key,
-            st.session_state.get("resilience_lag_mode", "Fixed lag"),
-        )
-        lag_reference = float(
-            st.session_state.get(
-                lag_reference_key,
-                st.session_state.get(
-                    f"resilience_lag_reference_{predictor}_0",
-                    lag_reference_default_base,
-                ),
-            )
-        )
-        lag_sensitivity = float(
-            st.session_state.get(
-                lag_sensitivity_key,
-                st.session_state.get(
-                    f"resilience_lag_sensitivity_{predictor}_0",
-                    float(st.session_state.get("resilience_lag_sensitivity", 1.0)),
-                ),
-            )
-        )
-
-        with st.expander("Per-trajectory settings", expanded=False):
-            trajectory_names = []
-            trajectory_means = []
-            trajectory_secondary_values = []
-            if resilience_2d_mode:
-                condition_config = PREDICTOR_CONFIG[_normalize_predictor(resilience_condition_predictor)]
-                condition_unit = str(condition_config["unit"])
-                condition_min = float(condition_config["min"])
-                condition_max = float(condition_config["max"])
-                condition_step = float(condition_config["step"])
-            for idx in range(trajectory_count):
-                if idx > 0:
-                    st.divider()
-                name_key = f"resilience_trajectory_name_{idx}"
-                trajectory_name = st.text_input(
-                    "Trajectory name",
-                    value=str(st.session_state.get(name_key, _default_trajectory_name(idx))),
-                    key=name_key,
-                    placeholder="e.g., Healthy",
-                )
-                cleaned_name = trajectory_name.strip() or _default_trajectory_name(idx)
-                trajectory_names.append(cleaned_name)
-                st.markdown(f"**{cleaned_name} settings**")
-                if enable_lag or enable_drift:
-                    st.caption(
-                        "Lag controls are configured in **Lag settings** and drift controls in **Drift settings**."
-                    )
-                if not enable_drift:
-                    if resilience_2d_mode:
-                        mean_value = float(default_mean_value)
-                        st.caption(
-                            f"Shared mean from **Predictor baseline**: "
-                            f"{mean_value:.2f} {predictor_config['unit']}."
-                        )
-                    else:
-                        mean_value = st.slider(
-                            f"Mean {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
-                            min_value=float(predictor_config["min"]),
-                            max_value=float(predictor_config["max"]),
-                            value=float(st.session_state.get(
-                                f"resilience_mean_{predictor}_{idx}",
-                                _default_trajectory_mean(predictor, idx),
-                            )),
-                            step=float(predictor_config["step"]),
-                            key=f"resilience_mean_{predictor}_{idx}",
-                            help=(
-                                "Trajectory-specific mean. The anomaly trajectory is added on top of this "
-                                "value to create this trajectory’s disturbance path."
-                            ),
-                        )
-                    trajectory_means.append(mean_value)
-                if resilience_2d_mode:
-                    secondary_value = float(
-                        st.slider(
-                            f"{_predictor_axis_label(resilience_condition_predictor)} ({condition_unit})",
-                            min_value=condition_min,
-                            max_value=condition_max,
-                            value=float(
-                                st.session_state.get(
-                                    f"resilience_condition_{resilience_condition_predictor}_{idx}",
-                                    25.0
-                                    if idx == 0 and resilience_condition_predictor == "T_leaf"
-                                    else 35.0
-                                    if idx == 1 and resilience_condition_predictor == "T_leaf"
-                                    else float(condition_config["default"]),
-                                )
-                            ),
-                            step=condition_step,
-                            key=f"resilience_condition_{resilience_condition_predictor}_{idx}",
-                        )
-                    )
-                    trajectory_secondary_values.append(secondary_value)
-                else:
-                    trajectory_secondary_values.append(np.nan)
-    
-        trajectory_drift_starts = []
-        trajectory_drift_ends = []
-        if enable_drift:
-            with st.expander("Drift settings", expanded=False):
-                for idx in range(trajectory_count):
-                    if idx > 0:
-                        st.divider()
-                    trajectory_default = float(_default_trajectory_mean(predictor, idx))
-                    if predictor == "T_leaf":
-                        if idx == 0:
-                            drift_default_start = 15.0
-                            drift_default_end = 25.0
-                        elif idx == 1:
-                            drift_default_start = 25.0
-                            drift_default_end = 35.0
-                        else:
-                            drift_default_start = trajectory_default
-                            drift_default_end = trajectory_default
-                        default_start = float(st.session_state.get(f"resilience_drift_start_{predictor}_{idx}", drift_default_start))
-                        default_end = float(st.session_state.get(f"resilience_drift_end_{predictor}_{idx}", drift_default_end))
-                    else:
-                        default_start = float(st.session_state.get(f"resilience_drift_start_{predictor}_{idx}", trajectory_default))
-                        default_end = float(st.session_state.get(f"resilience_drift_end_{predictor}_{idx}", trajectory_default))
-                    drift_start_key = f"resilience_drift_start_{predictor}_{idx}"
-                    drift_end_key = f"resilience_drift_end_{predictor}_{idx}"
-                    drift_start = st.slider(
-                        f"Start {_predictor_axis_label(predictor)} ({predictor_config['unit']}) (traj {idx + 1})",
-                        min_value=float(predictor_config["min"]),
-                        max_value=float(predictor_config["max"]),
-                        value=default_start,
-                        step=float(predictor_config["step"]),
-                        key=drift_start_key,
-                    )
-                    drift_end = st.slider(
-                        f"Final {_predictor_axis_label(predictor)} ({predictor_config['unit']}) (traj {idx + 1})",
-                        min_value=float(predictor_config["min"]),
-                        max_value=float(predictor_config["max"]),
-                        value=default_end,
-                        step=float(predictor_config["step"]),
-                        key=drift_end_key,
-                    )
-                    trajectory_drift_starts.append(float(drift_start))
-                    trajectory_drift_ends.append(float(drift_end))
-        else:
-            for idx in range(trajectory_count):
-                trajectory_default = float(_default_trajectory_mean(predictor, idx))
-                trajectory_drift_starts.append(
-                    float(st.session_state.get(f"resilience_drift_start_{predictor}_{idx}", trajectory_default))
-                )
-                trajectory_drift_ends.append(
-                    float(st.session_state.get(f"resilience_drift_end_{predictor}_{idx}", trajectory_default))
-                )
-
-        if enable_drift:
-            trajectory_means = [
-                0.5 * (trajectory_drift_starts[idx] + trajectory_drift_ends[idx])
-                for idx in range(trajectory_count)
-            ]
-    
-        if enable_lag:
-            with st.expander("Lag settings", expanded=False):
+            st.markdown("<div class='resilience-setting-heading'>Response lag settings</div>", unsafe_allow_html=True)
+            if enable_response_lag:
                 lag_steps_global = st.slider(
                     "Response lag (steps)",
                     min_value=0,
                     max_value=60,
                     value=lag_steps_global,
                     step=1,
-                    key="resilience_lag_steps",
-                    help="0 = immediate; higher values produce a slower response to disturbance.",
+                    key="resilience_response_lag_steps",
+                    help="0 = immediate; higher values produce a slower response to stressors.",
                 )
+                st.session_state["resilience_lag_steps"] = lag_steps_global
                 lag_mode = st.selectbox(
                     "Lag mode",
                     options=["Fixed lag", "Reference-based lag"],
@@ -2876,10 +2913,329 @@ When **Drift** is enabled, each trajectory follows:
                         lag_reference = float(st.session_state.get("temp_optimum_c", lag_reference_default_base))
                     else:
                         lag_reference = float(st.session_state.get(lag_reference_key, lag_reference_default_base))
-        else:
-            lag_steps_global = 0
-            lag_mode = "Fixed lag"
-            lag_reference = float(st.session_state.get("temp_optimum_c", lag_reference_default_base))
+            else:
+                lag_steps_global = 0
+                lag_mode = "Fixed lag"
+                lag_reference = float(st.session_state.get("temp_optimum_c", lag_reference_default_base))
+
+        with st.expander("Stressor", expanded=False):
+            st.markdown("<div class='resilience-setting-heading'>Primary stressor</div>", unsafe_allow_html=True)
+            predictor = st.selectbox(
+                "Variable",
+                options=PREDICTOR_OPTIONS,
+                key="resilience_predictor",
+                format_func=_predictor_axis_label,
+            )
+            predictor = _normalize_predictor(predictor)
+            predictor_config = PREDICTOR_CONFIG[predictor]
+
+            default_mean_key = f"resilience_default_mean_{predictor}"
+            default_mean_value = float(st.session_state.get(default_mean_key, predictor_config["default"]))
+            default_mean_value = st.slider(
+                f"Mean {_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                min_value=float(predictor_config["min"]),
+                max_value=float(predictor_config["max"]),
+                value=default_mean_value,
+                step=float(predictor_config["step"]),
+                key=default_mean_key,
+            )
+
+            st.markdown(
+                "<div class='resilience-setting-heading'>Secondary stressor</div>",
+                unsafe_allow_html=True,
+            )
+            if resilience_2d_mode:
+                if not st.session_state.get("resilience_2d_mode_initialized", False):
+                    condition_options = [p for p in PREDICTOR_OPTIONS if p != predictor]
+                    if not condition_options:
+                        condition_options = [PREDICTOR_OPTIONS[0]]
+                    if (
+                        "resilience_condition_predictor" not in st.session_state
+                        or st.session_state.get("resilience_condition_predictor") not in condition_options
+                    ):
+                        st.session_state["resilience_condition_predictor"] = condition_options[0]
+                    resilience_condition_predictor = st.session_state.get("resilience_condition_predictor", condition_options[0])
+                    if f"resilience_condition_{resilience_condition_predictor}_0" not in st.session_state:
+                        st.session_state[f"resilience_condition_{resilience_condition_predictor}_0"] = 25.0
+                    if f"resilience_condition_{resilience_condition_predictor}_1" not in st.session_state:
+                        st.session_state[f"resilience_condition_{resilience_condition_predictor}_1"] = 35.0
+                    st.session_state["resilience_2d_mode_initialized"] = True
+                    _apply_resilience_reference_environment(
+                        {predictor, st.session_state["resilience_condition_predictor"]}
+                    )
+                resilience_condition_predictor = st.selectbox(
+                    "Variable",
+                    options=[p for p in PREDICTOR_OPTIONS if p != predictor],
+                    key="resilience_condition_predictor",
+                    format_func=_predictor_axis_label,
+                    help=(
+                        "Each trajectory has a fixed value for this confounding stressor "
+                        "while the primary stressor forcing is shared."
+                    ),
+                )
+                if st.session_state.get("resilience_condition_predictor") == predictor:
+                    condition_options = [p for p in PREDICTOR_OPTIONS if p != predictor]
+                    if condition_options:
+                        st.session_state["resilience_condition_predictor"] = condition_options[0]
+                        resilience_condition_predictor = condition_options[0]
+                resilience_condition_predictor = _normalize_predictor(st.session_state.get("resilience_condition_predictor", "T_leaf"))
+            else:
+                st.session_state["resilience_2d_mode_initialized"] = False
+                resilience_condition_predictor = st.session_state.get("resilience_condition_predictor", "T_leaf")
+                resilience_condition_predictor = _normalize_predictor(resilience_condition_predictor)
+                if resilience_condition_predictor == predictor:
+                    fallback_predictors = [p for p in PREDICTOR_OPTIONS if p != predictor]
+                    if fallback_predictors:
+                        resilience_condition_predictor = fallback_predictors[0]
+                if f"resilience_condition_{resilience_condition_predictor}_0" not in st.session_state:
+                    st.session_state[f"resilience_condition_{resilience_condition_predictor}_0"] = 25.0
+                if f"resilience_condition_{resilience_condition_predictor}_1" not in st.session_state:
+                    st.session_state[f"resilience_condition_{resilience_condition_predictor}_1"] = 35.0
+                st.caption("Secondary stressor is disabled. Enable it in mechanisms to compare trajectories under different confounding conditions.")
+
+            if resilience_2d_mode:
+                condition_config = PREDICTOR_CONFIG[resilience_condition_predictor]
+                condition_unit = str(condition_config["unit"])
+                condition_min = float(condition_config["min"])
+                condition_max = float(condition_config["max"])
+                condition_step = float(condition_config["step"])
+                st.caption(
+                    f"Confounding stressor: {_predictor_axis_label(resilience_condition_predictor)}."
+                )
+            else:
+                condition_config = PREDICTOR_CONFIG[resilience_condition_predictor]
+                condition_unit = str(condition_config["unit"])
+                condition_min = float(condition_config["min"])
+                condition_max = float(condition_config["max"])
+                condition_step = float(condition_config["step"])
+
+            if enable_response_lag or enable_disturbance_lag or enable_drift:
+                st.caption("Lag controls are configured in **Response** and **Stressor lag settings**.")
+
+            st.markdown("<div class='resilience-setting-heading'>Trajectories</div>", unsafe_allow_html=True)
+            trajectory_names = []
+            trajectory_means = []
+            trajectory_secondary_values = []
+            trajectory_drift_starts = []
+            trajectory_drift_ends = []
+            for idx in range(trajectory_count):
+                name_key = f"resilience_trajectory_name_{idx}"
+                trajectory_name = st.text_input(
+                    "Name",
+                    value=str(st.session_state.get(name_key, _default_trajectory_name(idx))),
+                    key=name_key,
+                    placeholder="e.g., Healthy",
+                )
+                cleaned_name = trajectory_name.strip() or _default_trajectory_name(idx)
+                trajectory_names.append(cleaned_name)
+                st.markdown(f"**{cleaned_name}**")
+                trajectory_default = float(_default_trajectory_mean(predictor, idx))
+
+                if enable_drift:
+                    drift_default_start = trajectory_default
+                    drift_default_end = trajectory_default
+                    if predictor == "T_leaf":
+                        if idx == 0:
+                            drift_default_start = 15.0
+                            drift_default_end = 25.0
+                        elif idx == 1:
+                            drift_default_start = 25.0
+                            drift_default_end = 35.0
+                    drift_start = st.slider(
+                        f"{_predictor_axis_label(predictor)} start ({predictor_config['unit']})",
+                        min_value=float(predictor_config["min"]),
+                        max_value=float(predictor_config["max"]),
+                        value=float(
+                            st.session_state.get(
+                                f"resilience_drift_start_{predictor}_{idx}",
+                                drift_default_start,
+                            )
+                        ),
+                        step=float(predictor_config["step"]),
+                        key=f"resilience_drift_start_{predictor}_{idx}",
+                    )
+                    drift_end = st.slider(
+                        f"{_predictor_axis_label(predictor)} end ({predictor_config['unit']})",
+                        min_value=float(predictor_config["min"]),
+                        max_value=float(predictor_config["max"]),
+                        value=float(
+                            st.session_state.get(
+                                f"resilience_drift_end_{predictor}_{idx}",
+                                drift_default_end,
+                            )
+                        ),
+                        step=float(predictor_config["step"]),
+                        key=f"resilience_drift_end_{predictor}_{idx}",
+                    )
+                    drift_start = float(drift_start)
+                    drift_end = float(drift_end)
+                    trajectory_drift_starts.append(drift_start)
+                    trajectory_drift_ends.append(drift_end)
+                    trajectory_means.append(0.5 * (drift_start + drift_end))
+                else:
+                    trajectory_drift_starts.append(
+                        float(st.session_state.get(f"resilience_drift_start_{predictor}_{idx}", trajectory_default))
+                    )
+                    trajectory_drift_ends.append(
+                        float(st.session_state.get(f"resilience_drift_end_{predictor}_{idx}", trajectory_default))
+                    )
+                    if resilience_2d_mode:
+                        st.slider(
+                            f"{_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                            min_value=float(predictor_config["min"]),
+                            max_value=float(predictor_config["max"]),
+                            value=float(default_mean_value),
+                            step=float(predictor_config["step"]),
+                            disabled=True,
+                            key=f"resilience_primary_mean_fixed_{predictor}_{idx}",
+                        )
+                        trajectory_means.append(float(default_mean_value))
+                    else:
+                        mean_value = st.slider(
+                            f"{_predictor_axis_label(predictor)} ({predictor_config['unit']})",
+                            min_value=float(predictor_config["min"]),
+                            max_value=float(predictor_config["max"]),
+                            value=float(
+                                st.session_state.get(
+                                    f"resilience_mean_{predictor}_{idx}",
+                                    trajectory_default,
+                                )
+                            ),
+                            step=float(predictor_config["step"]),
+                            key=f"resilience_mean_{predictor}_{idx}",
+                        )
+                        trajectory_means.append(float(mean_value))
+                if resilience_2d_mode:
+                    secondary_value = float(
+                        st.slider(
+                            f"{_predictor_axis_label(resilience_condition_predictor)} ({condition_unit})",
+                            min_value=condition_min,
+                            max_value=condition_max,
+                            value=float(
+                                st.session_state.get(
+                                    f"resilience_condition_{resilience_condition_predictor}_{idx}",
+                                    25.0
+                                    if idx == 0 and resilience_condition_predictor == "T_leaf"
+                                    else 35.0
+                                    if idx == 1 and resilience_condition_predictor == "T_leaf"
+                                    else float(condition_config["default"]),
+                                )
+                            ),
+                            step=condition_step,
+                            key=f"resilience_condition_{resilience_condition_predictor}_{idx}",
+                        )
+                    )
+                    trajectory_secondary_values.append(secondary_value)
+                else:
+                    trajectory_secondary_values.append(np.nan)
+
+            st.markdown("<div class='resilience-setting-heading'>Fluctuations</div>", unsafe_allow_html=True)
+            amplitude_key = f"resilience_fluctuation_scale_{predictor}"
+            fluctuation_scale_mode = st.selectbox(
+                "Fluctuation scale",
+                ["Absolute units", "Percent of mean"],
+                index=0 if fluctuation_scale_mode == "Absolute units" else 1,
+                key="resilience_fluctuation_mode",
+            )
+            if fluctuation_scale_mode == "Absolute units":
+                fluctuation_scale = st.slider(
+                    "Fluctuation amplitude",
+                    min_value=float(predictor_config["step"]),
+                    max_value=float((predictor_config["max"] - predictor_config["min"]) / 2.0),
+                    value=float(st.session_state.get(amplitude_key, predictor_config["amplitude"])),
+                    step=float(predictor_config["step"]),
+                    key=amplitude_key,
+                )
+            else:
+                fluctuation_scale_pct = st.slider(
+                    "Fluctuation amplitude (% of mean)",
+                    min_value=1,
+                    max_value=30,
+                    value=fluctuation_scale_pct,
+                    step=1,
+                    key="resilience_fluctuation_scale_pct",
+                    help="Set the fluctuation amplitude as a percentage of the primary stressor mean.",
+                )
+                fluctuation_scale = default_mean_value * (fluctuation_scale_pct / 100.0)
+                st.caption(
+                    f"Default effective amplitude: {fluctuation_scale:.2f} {predictor_config['unit']}"
+                )
+            if enable_disturbance_lag:
+                forcing_mode = st.selectbox(
+                    "Stressor forcing mode",
+                    options=["white", "mean_reverting"],
+                    format_func=lambda value: "White noise (no memory)"
+                    if value == "white"
+                    else "Mean-reverting random walk",
+                    index=0 if forcing_mode == "white" else 1,
+                    key="resilience_forcing_mode",
+                    help="White noise produces independent stressor shocks each step; mean-reverting introduces persistence.",
+                )
+                forcing_white_noise = forcing_mode == "white"
+                mean_reversion = st.slider(
+                    "Mean reversion strength",
+                    min_value=0.0,
+                    max_value=0.95,
+                    value=mean_reversion,
+                    step=0.05,
+                    key="resilience_mean_reversion",
+                    disabled=forcing_white_noise,
+                    help="Higher values pull stressors back toward the previous state faster, reducing persistence.",
+                )
+                step_factor = st.slider(
+                    "Trajectory roughness",
+                    min_value=0.2,
+                    max_value=1.4,
+                    value=step_factor,
+                    step=0.05,
+                    key="resilience_step_factor",
+                    disabled=forcing_white_noise,
+                    help=(
+                        "Higher values create more volatile stressor paths, "
+                        "while lower values create smoother stressor forcing."
+                    ),
+                )
+                st.markdown("<div class='resilience-setting-heading'>Stressor lag settings</div>", unsafe_allow_html=True)
+                disturbance_lag_steps_global = st.slider(
+                    "Stressor lag (steps)",
+                    min_value=0,
+                    max_value=60,
+                    value=disturbance_lag_steps_global,
+                    step=1,
+                    key="resilience_disturbance_lag_steps",
+                    help="0 = immediate; higher values produce a slower stressor response.",
+                )
+                if forcing_white_noise:
+                    st.caption("Stressor lag mode currently uses **white noise**.")
+            else:
+                forcing_mode = "white"
+                forcing_white_noise = True
+                disturbance_lag_steps_global = 0
+                st.caption("Stressor lag mode is off; forcing uses **white noise**.")
+        with st.expander("Resilience indicators", expanded=False):
+            indicator_window = st.slider(
+                "Variance/autocorrelation rolling window (steps)",
+                min_value=5,
+                max_value=max(5, trajectory_steps),
+                value=min(indicator_window, max(5, trajectory_steps)),
+                step=1,
+                key="resilience_indicator_window",
+                help=(
+                    "Window size used for rolling variance and rolling autocorrelation calculations."
+                ),
+            )
+            diagnostic_window = st.slider(
+                "MK test rolling window (steps)",
+                min_value=5,
+                max_value=max(5, trajectory_steps),
+                value=min(diagnostic_window, max(5, trajectory_steps)),
+                step=1,
+                key="resilience_diagnostic_window",
+                help=(
+                    "Window size used for rolling series used in the "
+                    "Kendall-Mann trend diagnostics."
+                ),
+            )
     
         trajectory_settings = []
         for idx in range(trajectory_count):
@@ -2898,8 +3254,7 @@ When **Drift** is enabled, each trajectory follows:
                 }
             )
     
-        st.markdown("### Static parameters")
-        with st.expander("Model parameters", expanded=False):
+        with st.expander("Leaf Traits", expanded=False):
             vcmax25 = st.slider("V_cmax,25 (µmol m⁻² s⁻¹)", 10.0, 250.0, 80.0, 1.0, key="vcmax25")
             jmax25 = st.slider("J_max,25 (µmol m⁻² s⁻¹)", 30.0, 400.0, 150.0, 1.0, key="jmax25")
             tpu_enabled = st.toggle(
@@ -2976,24 +3331,37 @@ When **Drift** is enabled, each trajectory follows:
             ci = float(st.session_state.get("ci", PREDICTOR_CONFIG["C_i"]["default"]))
             tleaf = float(st.session_state.get("tleaf", PREDICTOR_CONFIG["T_leaf"]["default"]))
             vpd = float(st.session_state.get("vpd", PREDICTOR_CONFIG["VPD"]["default"]))
+
             if predictor == "PAR":
                 par = default_mean_value
-                st.caption("PAR is controlled by the predictor trajectories.")
+                st.caption("PAR is controlled by the primary stressor trajectory.")
+            elif resilience_2d_mode and resilience_condition_predictor == "PAR":
+                par = float(st.session_state.get("resilience_condition_PAR_0", par))
+                st.caption("PAR is controlled by the confounding stressor.")
             else:
                 par = st.slider("PAR (µmol m⁻² s⁻¹)", 0, 2400, 1200, 25, key="par")
             if predictor == "C_i":
                 ci = default_mean_value
-                st.caption("C_i is controlled by the predictor trajectories.")
+                st.caption("C_i is controlled by the primary stressor trajectory.")
+            elif resilience_2d_mode and resilience_condition_predictor == "C_i":
+                ci = float(st.session_state.get("resilience_condition_C_i_0", ci))
+                st.caption("C_i is controlled by the confounding stressor.")
             else:
                 ci = st.slider("C_i (ppm)", 20, 2000, 440, 1, key="ci")
             if predictor == "T_leaf":
                 tleaf = default_mean_value
-                st.caption("T_leaf is controlled by the predictor trajectories.")
+                st.caption("T_leaf is controlled by the primary stressor trajectory.")
+            elif resilience_2d_mode and resilience_condition_predictor == "T_leaf":
+                tleaf = float(st.session_state.get("resilience_condition_T_leaf_0", tleaf))
+                st.caption("T_leaf is controlled by the confounding stressor.")
             else:
                 tleaf = st.slider("Leaf temperature (°C)", 5.0, 50.0, 25.0, 0.5, key="tleaf")
             if predictor == "VPD":
                 vpd = default_mean_value
-                st.caption("VPD is controlled by the predictor trajectories.")
+                st.caption("VPD is controlled by the primary stressor trajectory.")
+            elif resilience_2d_mode and resilience_condition_predictor == "VPD":
+                vpd = float(st.session_state.get("resilience_condition_VPD_0", vpd))
+                st.caption("VPD is controlled by the confounding stressor.")
             else:
                 vpd = st.slider("VPD (kPa)", 0.1, 6.0, 1.2, 0.1, key="vpd")
 
@@ -3057,7 +3425,8 @@ When **Drift** is enabled, each trajectory follows:
         trajectory_steps,
         diagnostic_window,
         indicator_window,
-        enable_lag,
+        enable_response_lag,
+        enable_disturbance_lag,
         enable_drift,
         forcing_white_noise,
         resilience_2d_mode,
@@ -3070,6 +3439,7 @@ When **Drift** is enabled, each trajectory follows:
         seed,
         frame_speed_ms,
         lag_steps_global,
+        disturbance_lag_steps_global,
         lag_mode,
         lag_reference,
         lag_sensitivity,
@@ -3078,14 +3448,9 @@ When **Drift** is enabled, each trajectory follows:
     cached_payload = st.session_state.get("resilience_sim_cached_payload")
     signature_changed = cached_signature != requested_signature
     should_run_simulation = resilience_auto_update or run_resilience_sim or cached_payload is None
-    if signature_changed:
-        if resilience_auto_update:
-            st.info("Calculating trajectories for the updated settings...")
-        else:
-            st.info(
-                "Resilience settings changed but live recalculation is disabled. Click **Run resilience simulation** "
-                "to refresh the curves."
-            )
+    should_recompute_now = signature_changed and should_run_simulation
+    if not resilience_auto_update and signature_changed and not run_resilience_sim:
+        st.caption("Resilience settings changed. Click **Run resilience simulation** to refresh the curves.")
     if should_run_simulation:
         spinner_label = (
             "Calculating trajectories..."
@@ -3140,6 +3505,11 @@ When **Drift** is enabled, each trajectory follows:
                         value_min=-shared_anomaly_limit,
                         value_max=shared_anomaly_limit,
                     )[0]
+            if enable_disturbance_lag and disturbance_lag_steps_global > 0:
+                shared_anomaly = apply_first_order_lag(
+                    shared_anomaly,
+                    lag_steps=disturbance_lag_steps_global,
+                )
             shared_anomaly = shared_anomaly - np.nanmean(shared_anomaly)
             shared_anomaly_mean = float(np.nanmean(shared_anomaly))
             trajectory_values = trajectory_baselines + shared_anomaly[None, :]
@@ -3232,20 +3602,21 @@ When **Drift** is enabled, each trajectory follows:
                 lag_k = int(trajectory_settings[idx]["lag_steps"])
                 if lag_k <= 0:
                     continue
-                trajectory_response[idx] = apply_first_order_lag(
-                    trajectory_response[idx],
-                    lag_k,
-                    predictor_values=(
-                        trajectory_values[idx]
-                        if trajectory_settings[idx].get("lag_mode", "Fixed lag") != "Fixed lag"
-                        else None
-                    ),
-                    lag_reference=float(trajectory_settings[idx].get("lag_reference", trajectory_means[idx])),
-                    lag_sensitivity=float(trajectory_settings[idx].get("lag_sensitivity", 1.0)),
-                    use_distance_weight=(
-                        trajectory_settings[idx].get("lag_mode", "Fixed lag") != "Fixed lag"
-                    ),
-                )
+                if enable_response_lag:
+                    trajectory_response[idx] = apply_first_order_lag(
+                        trajectory_response[idx],
+                        lag_k,
+                        predictor_values=(
+                            trajectory_values[idx]
+                            if trajectory_settings[idx].get("lag_mode", "Fixed lag") != "Fixed lag"
+                            else None
+                        ),
+                        lag_reference=float(trajectory_settings[idx].get("lag_reference", trajectory_means[idx])),
+                        lag_sensitivity=float(trajectory_settings[idx].get("lag_sensitivity", 1.0)),
+                        use_distance_weight=(
+                            trajectory_settings[idx].get("lag_mode", "Fixed lag") != "Fixed lag"
+                        ),
+                    )
             predictor_anoms = trajectory_values - trajectory_means[:, None]
             response_anoms = trajectory_response - baseline_response[:, None]
 
@@ -3289,7 +3660,10 @@ When **Drift** is enabled, each trajectory follows:
                 "seed": seed,
                 "fluctuation_scale": fluctuation_scale,
                 "trajectory_steps": trajectory_steps,
-                "enable_lag": enable_lag,
+                "enable_response_lag": enable_response_lag,
+                "enable_disturbance_lag": enable_disturbance_lag,
+                "response_lag_steps": lag_steps_global,
+                "disturbance_lag_steps": disturbance_lag_steps_global,
                 "enable_drift": enable_drift,
                 "curve_min": curve_min,
                 "curve_max": curve_max,
@@ -3328,7 +3702,8 @@ When **Drift** is enabled, each trajectory follows:
     trajectory_steps = int(sim_data["trajectory_steps"])
     fluctuation_scale = float(sim_data["fluctuation_scale"])
     seed = int(sim_data["seed"])
-    enable_lag = bool(sim_data["enable_lag"])
+    enable_response_lag = bool(sim_data["enable_response_lag"])
+    enable_disturbance_lag = bool(sim_data["enable_disturbance_lag"])
     enable_drift = bool(sim_data["enable_drift"])
     predictor = sim_data["predictor"]
     response_var = sim_data["response_var"]
@@ -3345,19 +3720,39 @@ When **Drift** is enabled, each trajectory follows:
     with st.container():
         st.subheader("Trajectory simulation")
         if enable_drift:
-            if enable_lag:
+            if enable_response_lag and enable_disturbance_lag:
                 st.caption(
-                    "Mode: **Lag + drift**. Shared disturbance anomalies are lagged and each trajectory drifts "
-                    "linearly from its start to final predictor value."
+                    "Mode: **Stressor lag + response lag + drift**. Shared stressor anomalies are "
+                    "first lagged as forcing, then response lag is applied before converting to response."
+                )
+            elif enable_response_lag:
+                st.caption(
+                    "Mode: **Response lag + drift**. Shared stressor anomalies are applied to drifting trajectories while "
+                    "response lag smooths the photosynthesis response."
+                )
+            elif enable_disturbance_lag:
+                st.caption(
+                    "Mode: **Stressor lag + drift**. Shared stressor anomalies are lagged as forcing and "
+                    "each trajectory drifts linearly from start to final value."
                 )
             else:
                 st.caption(
-                    "Mode: **Drift only**. Shared disturbance anomalies are applied to trajectories whose predictors "
+                    "Mode: **Drift only**. Shared stressor anomalies are applied to trajectories whose predictors "
                     "drift linearly from start to final value."
                 )
-        elif enable_lag:
+        elif enable_response_lag and enable_disturbance_lag:
             st.caption(
-                "Mode: **Lag only**. Shared disturbance anomalies are applied with first-order lag."
+                "Mode: **Response lag + stressor lag**. Shared stressor anomalies are lagged first, then each "
+                "trajectory response is lag-smoothed."
+            )
+        elif enable_response_lag:
+            st.caption(
+                    "Mode: **Response lag only**. Shared stressor anomalies are converted with a first-order "
+                "response lag."
+            )
+        elif enable_disturbance_lag:
+            st.caption(
+                    "Mode: **Stressor lag only**. Shared stressor anomalies are smoothed before being added."
             )
         else:
             st.caption("Mode: **Basic**. Trajectories are shared-anomaly mean paths without lag or drift.")
@@ -3385,9 +3780,9 @@ When **Drift** is enabled, each trajectory follows:
             with chart_container[chart_col]:
                 st.plotly_chart(figure, use_container_width=True)
                 st.caption(
-                    f"Anomalies panel: common anomaly axis with dotted zero baselines at "
-                    f"Δ{predictor_axis_label}=0 and Δ{response_axis_label}=0; "
-                    f"solid shared Δ{predictor_axis_label} disturbance and solid colored Δ{response_axis_label} "
+                    f"Anomalies panel: Δ{predictor_axis_label} on the right y-axis and "
+                    f"Δ{response_axis_label} on the left y-axis, sharing one dotted zero reference line; "
+                    f"solid Δ{predictor_axis_label} stressor and solid colored Δ{response_axis_label} "
                     f"trajectories with current-state markers."
                 )
                 if resilience_2d_mode and setpoint_axis is not None and setpoint_curves is not None:
@@ -3416,7 +3811,7 @@ When **Drift** is enabled, each trajectory follows:
                         st.divider()
                         st.plotly_chart(setpoint_figure, use_container_width=True)
                         st.caption(
-                            f"Setpoint response curves at fixed disturbance baseline for "
+                            f"Secondary stressor response curves at fixed confounding stressor baseline for "
                             f"{_predictor_axis_label(resilience_condition_predictor)}; markers indicate each trajectory's "
                             f"configured setpoint."
                         )
