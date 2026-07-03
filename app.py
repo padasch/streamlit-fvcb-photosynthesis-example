@@ -1371,7 +1371,7 @@ def build_resilience_animation_figure(
                 x=time,
                 y=environment_anomaly,
                 mode="lines",
-                name=f"Δ{predictor_label} forcing",
+                name=f"Δ{predictor_label} disturbance",
                 line=dict(color="black", width=1.6),
                 showlegend=False,
             ),
@@ -1471,7 +1471,7 @@ def build_resilience_animation_figure(
                 size=9,
                 symbol="square",
             ),
-            name=f"Δ{predictor_label} forcing",
+            name=f"Δ{predictor_label} disturbance",
             showlegend=True,
             visible="legendonly",
         ),
@@ -2261,6 +2261,8 @@ def render_resilience_page():
         condition_predictor: str,
         first_condition: float,
         second_condition: float,
+        enable_lag: bool = False,
+        enable_drift: bool = False,
     ) -> None:
         st.session_state["resilience_2d_mode"] = True
         st.session_state["resilience_predictor"] = disturbance_predictor
@@ -2268,6 +2270,8 @@ def render_resilience_page():
         st.session_state["resilience_2d_mode_initialized"] = True
         st.session_state[f"resilience_condition_{condition_predictor}_0"] = float(first_condition)
         st.session_state[f"resilience_condition_{condition_predictor}_1"] = float(second_condition)
+        st.session_state["resilience_enable_lag"] = bool(enable_lag)
+        st.session_state["resilience_enable_drift"] = bool(enable_drift)
         if st.session_state.get("resilience_trajectory_count", 2) >= 2:
             st.session_state["resilience_trajectory_name_0"] = "Healthy"
             st.session_state["resilience_trajectory_name_1"] = "Stressed"
@@ -2290,17 +2294,7 @@ def render_resilience_page():
         )
 
     with st.sidebar:
-        resilience_auto_update = st.session_state.get("resilience_auto_update", True)
-        run_resilience_sim = False
-        if not resilience_auto_update:
-            st.caption("Automatic recalculation is off.")
-            run_resilience_sim = st.button(
-                "Run resilience simulation",
-                key="resilience_run_simulation",
-                use_container_width=True,
-                type="primary",
-                help="Apply current resilience settings and refresh charts.",
-            )
+        st.markdown("### General description")
 
         with st.expander("Model description", expanded=False):
             st.markdown(
@@ -2311,7 +2305,7 @@ def render_resilience_page():
   - **Lag**: first-order response lag is applied after model evaluation.
   - **Drift**: each trajectory follows a predictor trajectory that drifts linearly from start to final value.
   - A common, shared environmental anomaly is generated once and then added to each trajectory base path.
-  - The default forcing mode is white noise (independent shocks, no memory). Optionally switch to mean-reverting forcing for persistent trajectories.
+  - The default disturbance mode is white noise (independent shocks, no memory). Optionally switch to mean-reverting disturbance for persistent trajectories.
 - Each trajectory is evaluated through the same FvCB evaluator used in the photosynthesis tab, with all non-target parameters held fixed.
 - Baseline response is computed at each trajectory mean.
 - Trajectory anomalies are shown as:
@@ -2329,14 +2323,16 @@ def render_resilience_page():
 
   where `k = 0` is immediate response and larger values produce slower response.
 
-Higher lag values smooth and delay response to forcing, while all other model physics and diagnostics remain unchanged.
+Higher lag values smooth and delay response to disturbance, while all other model physics and diagnostics remain unchanged.
 
 When **Drift** is enabled, each trajectory follows:
 
 - `predictor(t) = drift_start + (drift_end - drift_start) * (t / (T-1))`
-- Shared anomalies are added afterward based on the selected forcing mode.
+- Shared anomalies are added afterward based on the selected disturbance mode.
                 """
             )
+
+        st.markdown("### Visual settings")
         with st.expander("Visual settings", expanded=False):
             width = st.session_state.get("display_width", 75)
             if not (0 <= width <= 100):
@@ -2388,15 +2384,119 @@ When **Drift** is enabled, each trajectory follows:
             animation_height = int(min(1800, max(450, round(display_height * 1.5))))
             diagnostic_height = int(max(320, min(720, round(display_height * 0.52))))
 
-        with st.expander("Setup - Disturbance", expanded=False):
+        st.markdown("### Mechanisms")
+        with st.expander("Simulation toggles", expanded=False):
+            resilience_auto_update = st.session_state.get("resilience_auto_update", True)
+            run_resilience_sim = False
+            if not resilience_auto_update:
+                st.caption("Automatic recalculation is off.")
+                run_resilience_sim = st.button(
+                    "Run resilience simulation",
+                    key="resilience_run_simulation",
+                    use_container_width=True,
+                    type="primary",
+                    help="Apply current resilience settings and refresh charts.",
+                )
+            resilience_auto_update = st.toggle(
+                "Auto-update resilience simulation",
+                value=st.session_state.get("resilience_auto_update", True),
+                key="resilience_auto_update",
+                help="When enabled, simulation recomputes continuously as controls change. Disable for click-to-apply behavior.",
+            )
+            enable_lag = st.toggle(
+                "Enable lag",
+                value=enable_lag,
+                key="resilience_enable_lag",
+                help="Adds post-processing response lag to each trajectory.",
+            )
+            enable_drift = st.toggle(
+                "Enable drift",
+                value=enable_drift,
+                key="resilience_enable_drift",
+                help="Adds a linear start-to-final drift to each trajectory baseline.",
+            )
+
+        st.markdown("### Presets")
+        st.markdown(
+            "<div style=\"background:#e9f1ff;border:1px solid #9fbff2;border-radius:8px;padding:6px 10px;"
+            "margin:2px 0;color:#102a63;\"><strong>Preset scenarios</strong> (disturbance setups)</div>",
+            unsafe_allow_html=True,
+        )
+        with st.expander("Quick presets", expanded=False):
+            st.markdown("#### Tleaf fluctuation presets")
+            preset_col_1, preset_col_2 = st.columns(2)
+            with preset_col_1:
+                st.button(
+                    "Tleaf fluctuations @ 25 and 35 °C",
+                    key="resilience_preset_tleaf_25_35",
+                    use_container_width=True,
+                    help="Shared T_leaf disturbance with setpoint temperatures 25 °C and 35 °C.",
+                    on_click=_apply_resilience_preset,
+                    args=("T_leaf", "PAR", 25.0, 35.0, False, False),
+                )
+                st.button(
+                    "Tleaf fluctuations @ 25 and 35 °C + lag",
+                    key="resilience_preset_tleaf_25_35_lag",
+                    use_container_width=True,
+                    help="As above, with response lag enabled.",
+                    on_click=_apply_resilience_preset,
+                    args=("T_leaf", "PAR", 25.0, 35.0, True, False),
+                )
+                st.button(
+                    "Tleaf fluctuations @ 25 and 35 °C + lag + drift",
+                    key="resilience_preset_tleaf_25_35_lag_drift",
+                    use_container_width=True,
+                    help="As above, with lag and drift enabled.",
+                    on_click=_apply_resilience_preset,
+                    args=("T_leaf", "PAR", 25.0, 35.0, True, True),
+                )
+            with preset_col_2:
+                st.button(
+                    "Light intensity fluctuations @ 300 and 900",
+                    key="resilience_preset_par_300_900",
+                    use_container_width=True,
+                    help="Shared PAR disturbance with trajectory setpoints 300 and 900.",
+                    on_click=_apply_resilience_preset,
+                    args=("PAR", "T_leaf", 300.0, 900.0, False, False),
+                )
+                st.button(
+                    "Light intensity fluctuations @ 300 and 900 + lag",
+                    key="resilience_preset_par_300_900_lag",
+                    use_container_width=True,
+                    help="As above, with response lag enabled.",
+                    on_click=_apply_resilience_preset,
+                    args=("PAR", "T_leaf", 300.0, 900.0, True, False),
+                )
+                st.button(
+                    "Light intensity fluctuations @ 300 and 900 + lag + drift",
+                    key="resilience_preset_par_300_900_lag_drift",
+                    use_container_width=True,
+                    help="As above, with lag and drift enabled.",
+                    on_click=_apply_resilience_preset,
+                    args=("PAR", "T_leaf", 300.0, 900.0, True, True),
+                )
+
+            st.button(
+                "1D: Shared disturbance only",
+                key="resilience_preset_default_1d",
+                use_container_width=True,
+                help="Return to 2D mode off with shared disturbance (no trajectory conditioning).",
+                on_click=_apply_resilience_1d_preset,
+            )
+
+        st.markdown("### Target")
+        with st.expander("Setup - Target", expanded=False):
             response_var = st.selectbox(
                 "Target (y-axis)",
                 options=RESPONSE_OPTIONS,
                 key="resilience_response_var",
                 format_func=_response_axis_label,
             )
+
+        st.markdown("### Disturbance")
+        with st.expander("Setup - Disturbance", expanded=False):
             predictor = st.selectbox(
-                "Fluctuating predictor (disturbance axis)",
+                "Disturbance predictor (x-axis)",
                 options=PREDICTOR_OPTIONS,
                 key="resilience_predictor",
                 format_func=_predictor_axis_label,
@@ -2429,7 +2529,7 @@ When **Drift** is enabled, each trajectory follows:
                 value=resilience_2d_mode,
                 key="resilience_2d_mode",
                 help=(
-                    "Use one shared forcing predictor trajectory, while each trajectory has a "
+                    "Use one shared disturbance predictor trajectory, while each trajectory has a "
                     "different fixed value for a second conditioning predictor."
                 ),
             )
@@ -2458,26 +2558,7 @@ When **Drift** is enabled, each trajectory follows:
                 st.session_state["resilience_2d_mode_initialized"] = False
                 resilience_condition_predictor = st.session_state.get("resilience_condition_predictor", "T_leaf")
 
-            resilience_auto_update = st.toggle(
-                "Auto-update resilience simulation",
-                value=st.session_state.get("resilience_auto_update", True),
-                key="resilience_auto_update",
-                help="When enabled, simulation recomputes continuously as controls change. Disable for click-to-apply behavior.",
-            )
-            enable_lag = st.toggle(
-                "Enable lag",
-                value=enable_lag,
-                key="resilience_enable_lag",
-                help="Adds post-processing response lag to each trajectory.",
-            )
-            enable_drift = st.toggle(
-                "Enable drift",
-                value=enable_drift,
-                key="resilience_enable_drift",
-                help="Adds a linear start-to-final drift to each trajectory baseline.",
-            )
-
-        with st.expander("Forcing statistics", expanded=False):
+        with st.expander("Disturbance statistics", expanded=False):
             amplitude_key = f"resilience_fluctuation_scale_{predictor}"
             fluctuation_scale_mode = st.selectbox(
                 "Fluctuation scale",
@@ -2508,14 +2589,14 @@ When **Drift** is enabled, each trajectory follows:
                     f"Default effective amplitude: {fluctuation_scale:.2f} {predictor_config['unit']}"
                 )
             forcing_mode = st.selectbox(
-                "Environmental forcing memory",
+                "Environmental disturbance memory",
                 options=["white", "mean_reverting"],
                 format_func=lambda value: "White noise (no memory)"
                 if value == "white"
                 else "Mean-reverting random walk",
                 index=0 if forcing_mode == "white" else 1,
                 key="resilience_forcing_mode",
-                help="White noise produces independent forcing shocks each step; mean-reverting introduces persistence.",
+                help="White noise produces independent disturbance shocks each step; mean-reverting introduces persistence.",
             )
             forcing_white_noise = forcing_mode == "white"
             mean_reversion = st.slider(
@@ -2538,7 +2619,7 @@ When **Drift** is enabled, each trajectory follows:
             )
             if forcing_white_noise:
                 st.caption(
-                    "Forcing memory is off by default: predictor anomaly has no autocorrelation by construction."
+                    "Disturbance memory is off by default: predictor anomaly has no autocorrelation by construction."
                 )
             seed = st.number_input(
                 "Default random seed",
@@ -2549,6 +2630,7 @@ When **Drift** is enabled, each trajectory follows:
                 key="resilience_seed",
             )
 
+        st.markdown("### Resilience")
         with st.expander("Resilience indicators", expanded=False):
             indicator_window = st.slider(
                 "Variance/autocorrelation rolling window (steps)",
@@ -2659,7 +2741,7 @@ When **Drift** is enabled, each trajectory follows:
                             key=f"resilience_mean_{predictor}_{idx}",
                             help=(
                                 "Trajectory-specific mean. The anomaly trajectory is added on top of this "
-                                "value to create this trajectory’s forcing path."
+                                "value to create this trajectory’s disturbance path."
                             ),
                         )
                     trajectory_means.append(mean_value)
@@ -2755,7 +2837,7 @@ When **Drift** is enabled, each trajectory follows:
                     value=lag_steps_global,
                     step=1,
                     key="resilience_lag_steps",
-                    help="0 = immediate; higher values produce a slower response to forcing.",
+                    help="0 = immediate; higher values produce a slower response to disturbance.",
                 )
                 lag_mode = st.selectbox(
                     "Lag mode",
@@ -2816,6 +2898,7 @@ When **Drift** is enabled, each trajectory follows:
                 }
             )
     
+        st.markdown("### Static parameters")
         with st.expander("Model parameters", expanded=False):
             vcmax25 = st.slider("V_cmax,25 (µmol m⁻² s⁻¹)", 10.0, 250.0, 80.0, 1.0, key="vcmax25")
             jmax25 = st.slider("J_max,25 (µmol m⁻² s⁻¹)", 30.0, 400.0, 150.0, 1.0, key="jmax25")
@@ -2921,40 +3004,6 @@ When **Drift** is enabled, each trajectory follows:
             type="primary",
             key="resilience_reset_all_settings",
         )
-
-        st.markdown("### Quick presets")
-        st.markdown("#### Default 1D graphs")
-        st.button(
-            "1D: Shared disturbance only",
-            key="resilience_preset_default_1d",
-            use_container_width=True,
-            help="Return to 2D mode off with shared disturbance (no trajectory conditioning).",
-            on_click=_apply_resilience_1d_preset,
-        )
-        st.markdown("#### Default 2D graphs")
-        preset_col_1, preset_col_2 = st.columns(2)
-        with preset_col_1:
-            st.button(
-                "PAR fluctuations @ 25/35 °C",
-                key="resilience_preset_par_25_35",
-                use_container_width=True,
-                help=(
-                    "Shared PAR disturbance; trajectory T_leaf setpoints at 25 °C and 35 °C."
-                ),
-                on_click=_apply_resilience_preset,
-                args=("PAR", "T_leaf", 25.0, 35.0),
-            )
-        with preset_col_2:
-            st.button(
-                "T_leaf fluctuations @ 300/900 PAR",
-                key="resilience_preset_tleaf_300_900",
-                use_container_width=True,
-                help=(
-                    "Shared T_leaf disturbance; trajectory PAR setpoints at 300 and 900."
-                ),
-                on_click=_apply_resilience_preset,
-                args=("T_leaf", "PAR", 300.0, 900.0),
-            )
 
     profile = {
         "par": par,
@@ -3298,17 +3347,17 @@ When **Drift** is enabled, each trajectory follows:
         if enable_drift:
             if enable_lag:
                 st.caption(
-                    "Mode: **Lag + drift**. Shared forcing anomalies are lagged and each trajectory drifts "
+                    "Mode: **Lag + drift**. Shared disturbance anomalies are lagged and each trajectory drifts "
                     "linearly from its start to final predictor value."
                 )
             else:
                 st.caption(
-                    "Mode: **Drift only**. Shared forcing anomalies are applied to trajectories whose predictors "
+                    "Mode: **Drift only**. Shared disturbance anomalies are applied to trajectories whose predictors "
                     "drift linearly from start to final value."
                 )
         elif enable_lag:
             st.caption(
-                "Mode: **Lag only**. Shared forcing anomalies are applied with first-order lag."
+                "Mode: **Lag only**. Shared disturbance anomalies are applied with first-order lag."
             )
         else:
             st.caption("Mode: **Basic**. Trajectories are shared-anomaly mean paths without lag or drift.")
@@ -3338,7 +3387,7 @@ When **Drift** is enabled, each trajectory follows:
                 st.caption(
                     f"Anomalies panel: common anomaly axis with dotted zero baselines at "
                     f"Δ{predictor_axis_label}=0 and Δ{response_axis_label}=0; "
-                    f"solid shared Δ{predictor_axis_label} forcing and solid colored Δ{response_axis_label} "
+                    f"solid shared Δ{predictor_axis_label} disturbance and solid colored Δ{response_axis_label} "
                     f"trajectories with current-state markers."
                 )
                 if resilience_2d_mode and setpoint_axis is not None and setpoint_curves is not None:
