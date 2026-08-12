@@ -66,6 +66,9 @@ def _resilience_sim_signature(
             str(settings.get("lag_mode", "Fixed lag")),
             float(settings.get("lag_reference", 0.0)),
             float(settings.get("lag_sensitivity", 1.0)),
+            str(settings.get("lag_driver", "Primary stressor")),
+            str(settings.get("lag_driver_predictor", predictor)),
+            float(settings.get("lag_distance_unit", 1.0)),
             float(settings.get("secondary_value", 0.0))
             if np.isfinite(float(settings.get("secondary_value", 0.0)))
             else -1.0e12,
@@ -380,44 +383,35 @@ def apply_first_order_lag(
     lag_reference: float | None = None,
     lag_sensitivity: float = 1.0,
     use_distance_weight: bool = False,
+    lag_distance_unit: float = 1.0,
 ) -> np.ndarray:
-    """Apply a first-order lag to a 1D trajectory with optional distance-weighted lag.
+    """Apply a fixed or reference-based first-order lag to a 1D response trajectory.
 
-    The distance weighting is based on how far predictor values are from a reference point:
-    lag_k(t) = lag_steps * (1 + lag_sensitivity * |x_t - lag_reference| / distance_scale),
-    where distance_scale is the maximum predictor distance to the reference.
+    In dynamic mode, lag is zero at the reference and increases linearly with distance:
+    lag_k(t) = lag_sensitivity * |x_t - lag_reference| / lag_distance_unit.
     """
     values = np.asarray(response_values, dtype=float)
     lag_steps = max(int(lag_steps), 0)
     lagged = values.copy()
 
-    # No lag should be exactly identity.
-    if lag_steps == 0:
-        return lagged
-
-    alpha = 1.0 / (1.0 + lag_steps)
-
     use_distance_weight = (
         use_distance_weight
         and predictor_values is not None
         and lag_reference is not None
-        and lag_sensitivity > 0
+        and lag_sensitivity >= 0
         and np.isfinite(lag_reference)
+        and np.isfinite(lag_distance_unit)
+        and lag_distance_unit > 0
     )
     predictor_array = np.asarray(predictor_values, dtype=float) if use_distance_weight else None
     if use_distance_weight and predictor_array.shape != values.shape:
         use_distance_weight = False
-    if use_distance_weight:
-        finite_predictor = np.isfinite(predictor_array)
-        if not finite_predictor.any():
-            use_distance_weight = False
-        else:
-            predictor_min = float(np.nanmin(predictor_array))
-            predictor_max = float(np.nanmax(predictor_array))
-            reference = float(lag_reference)
-            distance_scale = max(abs(reference - predictor_min), abs(predictor_max - reference))
-            if not np.isfinite(distance_scale) or distance_scale <= 0:
-                use_distance_weight = False
+
+    # Fixed lag zero, or an invalid dynamic driver with zero fixed lag, is identity.
+    if lag_steps == 0 and not use_distance_weight:
+        return lagged
+
+    alpha = 1.0 / (1.0 + lag_steps)
 
     finite_idx = np.flatnonzero(np.isfinite(values))
     if finite_idx.size == 0:
@@ -438,10 +432,10 @@ def apply_first_order_lag(
     for start, end in segments:
         lagged[start] = values[start]
         for step in range(start + 1, end + 1):
-            if use_distance_weight:
+            if use_distance_weight and np.isfinite(predictor_array[step]):
                 distance = abs(float(predictor_array[step]) - float(lag_reference))
-                dynamic_lag = lag_steps * (1.0 + lag_sensitivity * (distance / distance_scale))
-                effective_alpha = 1.0 / (1.0 + dynamic_lag) if dynamic_lag >= 0 else alpha
+                dynamic_lag = lag_sensitivity * distance / lag_distance_unit
+                effective_alpha = 1.0 / (1.0 + dynamic_lag)
             else:
                 effective_alpha = alpha
             lagged[step] = lagged[step - 1] + effective_alpha * (values[step] - lagged[step - 1])
@@ -521,6 +515,13 @@ PREDICTOR_CONFIG = {
         "step": 0.1,
         "amplitude": 0.2,
     },
+}
+
+LAG_DISTANCE_CONFIG = {
+    "PAR": {"unit_size": 100.0, "label": "100 µmol m⁻² s⁻¹ PAR"},
+    "C_i": {"unit_size": 50.0, "label": "50 ppm C_i"},
+    "T_leaf": {"unit_size": 1.0, "label": "1 °C"},
+    "VPD": {"unit_size": 1.0, "label": "1 kPa VPD"},
 }
 
 
@@ -1203,6 +1204,7 @@ def reset_all_settings():
         "resilience_lag_default_steps": 1,
         "resilience_lag_mode": "Fixed lag",
         "resilience_lag_sensitivity": 1.0,
+        "resilience_lag_driver": "Primary stressor",
         "resilience_2d_mode": False,
         "resilience_2d_mode_initialized": False,
         "resilience_condition_predictor": "T_leaf",
@@ -2598,6 +2600,12 @@ def render_resilience_page():
         lag_mode_key,
         st.session_state.get("resilience_lag_mode", "Fixed lag"),
     )
+    if lag_mode == "Reference-based lag":
+        lag_mode = "Dynamic lag"
+        st.session_state[lag_mode_key] = lag_mode
+    lag_driver = st.session_state.get("resilience_lag_driver", "Primary stressor")
+    lag_driver_predictor = predictor
+    lag_distance_unit = float(LAG_DISTANCE_CONFIG[predictor]["unit_size"])
     lag_reference = float(
         st.session_state.get(
             lag_reference_key,
@@ -2880,25 +2888,62 @@ When **Stressor drift** is enabled, each trajectory follows:
             )
             st.markdown("<div class='resilience-setting-heading'>Response lag settings</div>", unsafe_allow_html=True)
             if enable_response_lag:
-                lag_steps_global = st.slider(
-                    "Response lag (steps)",
-                    min_value=0,
-                    max_value=60,
-                    value=lag_steps_global,
-                    step=1,
-                    key="resilience_response_lag_steps",
-                    help="0 = immediate; higher values produce a slower response to stressors.",
-                )
-                st.session_state["resilience_lag_steps"] = lag_steps_global
                 lag_mode = st.selectbox(
-                    "Lag mode",
-                    options=["Fixed lag", "Reference-based lag"],
+                    "Response lag mode",
+                    options=["Fixed lag", "Dynamic lag"],
                     index=0 if lag_mode == "Fixed lag" else 1,
                     key=lag_mode_key,
-                    help="Use reference-based lag if lag changes with stress relative to the chosen reference.",
+                    help=(
+                        "Fixed lag uses one response lag throughout. Dynamic lag is immediate at the "
+                        "reference and becomes slower as the lag driver moves away from it."
+                    ),
                 )
-                if lag_mode == "Reference-based lag":
-                    if predictor == "T_leaf":
+                if lag_mode == "Fixed lag":
+                    lag_steps_global = st.slider(
+                        "Response lag (steps)",
+                        min_value=0,
+                        max_value=60,
+                        value=lag_steps_global,
+                        step=1,
+                        key="resilience_response_lag_steps",
+                        help="0 = immediate; higher values produce a slower response to stressors.",
+                    )
+                    st.session_state["resilience_lag_steps"] = lag_steps_global
+                    lag_driver = "Primary stressor"
+                    lag_driver_predictor = predictor
+                    lag_distance_unit = float(LAG_DISTANCE_CONFIG[predictor]["unit_size"])
+                else:
+                    lag_steps_global = 0
+                    if resilience_2d_mode:
+                        lag_driver = st.selectbox(
+                            "Lag driver",
+                            options=["Primary stressor", "Confounding stressor"],
+                            key="resilience_lag_driver",
+                            help=(
+                                "Select which environmental variable determines response speed. "
+                                "The response itself is still driven by the full FvCB calculation."
+                            ),
+                        )
+                    else:
+                        lag_driver = "Primary stressor"
+                    lag_driver_predictor = (
+                        resilience_condition_predictor
+                        if lag_driver == "Confounding stressor" and resilience_2d_mode
+                        else predictor
+                    )
+                    driver_config = PREDICTOR_CONFIG[lag_driver_predictor]
+                    driver_reference_key = f"resilience_lag_reference_{lag_driver_predictor}"
+                    driver_sensitivity_key = f"resilience_lag_sensitivity_{lag_driver_predictor}"
+                    lag_distance_unit = float(LAG_DISTANCE_CONFIG[lag_driver_predictor]["unit_size"])
+                    lag_reference = float(
+                        st.session_state.get(
+                            driver_reference_key,
+                            float(st.session_state.get("temp_optimum_c", 25.0))
+                            if lag_driver_predictor == "T_leaf"
+                            else float(driver_config["default"]),
+                        )
+                    )
+                    if lag_driver_predictor == "T_leaf":
                         lag_reference = float(st.session_state.get("temp_optimum_c", lag_reference_default_base))
                         st.caption(
                             f"Lag reference fixed to temperature optimum: {lag_reference:.2f} °C"
@@ -2906,30 +2951,42 @@ When **Stressor drift** is enabled, each trajectory follows:
                     else:
                         lag_reference = st.slider(
                             "Lag reference",
-                            min_value=float(predictor_config["min"]),
-                            max_value=float(predictor_config["max"]),
+                            min_value=float(driver_config["min"]),
+                            max_value=float(driver_config["max"]),
                             value=lag_reference,
-                            step=float(predictor_config["step"]),
-                            key=lag_reference_key,
+                            step=float(driver_config["step"]),
+                            key=driver_reference_key,
                             help="Higher lag when predictor moves away from this value.",
                         )
+                    lag_sensitivity = float(
+                        st.session_state.get(
+                            driver_sensitivity_key,
+                            st.session_state.get("resilience_lag_sensitivity", 1.0),
+                        )
+                    )
+                    sensitivity_unit_label = LAG_DISTANCE_CONFIG[lag_driver_predictor]["label"]
                     lag_sensitivity = st.slider(
-                        "Distance sensitivity",
+                        f"Lag sensitivity (steps per {sensitivity_unit_label})",
                         min_value=0.0,
                         max_value=5.0,
                         value=lag_sensitivity,
                         step=0.05,
-                        key=lag_sensitivity_key,
-                        help="Scales how strongly distance from the reference increases lag.",
+                        key=driver_sensitivity_key,
+                        help=(
+                            "Dynamic lag = sensitivity × distance from reference. For example, with "
+                            "T_leaf sensitivity 1, distances of 0, 1, and 2 °C produce lag values "
+                            "of 0, 1, and 2."
+                        ),
                     )
-                else:
-                    if predictor == "T_leaf":
-                        lag_reference = float(st.session_state.get("temp_optimum_c", lag_reference_default_base))
-                    else:
-                        lag_reference = float(st.session_state.get(lag_reference_key, lag_reference_default_base))
+                    st.caption(
+                        "At the reference the response is immediate. Lag increases linearly with absolute distance."
+                    )
             else:
                 lag_steps_global = 0
                 lag_mode = "Fixed lag"
+                lag_driver = "Primary stressor"
+                lag_driver_predictor = predictor
+                lag_distance_unit = float(LAG_DISTANCE_CONFIG[predictor]["unit_size"])
                 lag_reference = float(st.session_state.get("temp_optimum_c", lag_reference_default_base))
 
         with st.expander("Stressor", expanded=False):
@@ -3259,6 +3316,9 @@ When **Stressor drift** is enabled, each trajectory follows:
                     "lag_mode": lag_mode,
                     "lag_reference": lag_reference,
                     "lag_sensitivity": lag_sensitivity,
+                    "lag_driver": lag_driver,
+                    "lag_driver_predictor": lag_driver_predictor,
+                    "lag_distance_unit": lag_distance_unit,
                     "drift_start": trajectory_drift_starts[idx],
                     "drift_end": trajectory_drift_ends[idx],
                 }
@@ -3610,22 +3670,30 @@ When **Stressor drift** is enabled, each trajectory follows:
                 )
             for idx in range(trajectory_count):
                 lag_k = int(trajectory_settings[idx]["lag_steps"])
-                if lag_k <= 0:
-                    continue
                 if enable_response_lag:
+                    dynamic_lag = trajectory_settings[idx].get("lag_mode") == "Dynamic lag"
+                    if not dynamic_lag and lag_k <= 0:
+                        continue
+                    if (
+                        dynamic_lag
+                        and resilience_2d_mode
+                        and trajectory_settings[idx].get("lag_driver") == "Confounding stressor"
+                    ):
+                        lag_driver_values = np.full_like(
+                            trajectory_values[idx],
+                            float(trajectory_settings[idx].get("secondary_value", np.nan)),
+                            dtype=float,
+                        )
+                    else:
+                        lag_driver_values = trajectory_values[idx]
                     trajectory_response[idx] = apply_first_order_lag(
                         trajectory_response[idx],
                         lag_k,
-                        predictor_values=(
-                            trajectory_values[idx]
-                            if trajectory_settings[idx].get("lag_mode", "Fixed lag") != "Fixed lag"
-                            else None
-                        ),
+                        predictor_values=lag_driver_values if dynamic_lag else None,
                         lag_reference=float(trajectory_settings[idx].get("lag_reference", trajectory_means[idx])),
                         lag_sensitivity=float(trajectory_settings[idx].get("lag_sensitivity", 1.0)),
-                        use_distance_weight=(
-                            trajectory_settings[idx].get("lag_mode", "Fixed lag") != "Fixed lag"
-                        ),
+                        use_distance_weight=dynamic_lag,
+                        lag_distance_unit=float(trajectory_settings[idx].get("lag_distance_unit", 1.0)),
                     )
             predictor_anoms = trajectory_values - trajectory_means[:, None]
             response_anoms = trajectory_response - baseline_response[:, None]
