@@ -69,6 +69,11 @@ def _resilience_sim_signature(
             str(settings.get("lag_driver", "Primary stressor")),
             str(settings.get("lag_driver_predictor", predictor)),
             float(settings.get("lag_distance_unit", 1.0)),
+            int(bool(settings.get("damage_accumulation_enabled", False))),
+            float(settings.get("damage_accumulation_rate", 0.0)),
+            float(settings.get("damage_recovery_rate", 0.0)),
+            float(settings.get("damage_tolerance", 0.0)),
+            float(settings.get("damage_max_lag", 0.0)),
             float(settings.get("secondary_value", 0.0))
             if np.isfinite(float(settings.get("secondary_value", 0.0)))
             else -1.0e12,
@@ -384,11 +389,19 @@ def apply_first_order_lag(
     lag_sensitivity: float = 1.0,
     use_distance_weight: bool = False,
     lag_distance_unit: float = 1.0,
+    damage_accumulation_enabled: bool = False,
+    damage_accumulation_rate: float = 0.0,
+    damage_recovery_rate: float = 0.0,
+    damage_tolerance: float = 0.0,
+    damage_max_lag: float = 60.0,
 ) -> np.ndarray:
     """Apply a fixed or reference-based first-order lag to a 1D response trajectory.
 
     In dynamic mode, lag is zero at the reference and increases linearly with distance:
     lag_k(t) = lag_sensitivity * |x_t - lag_reference| / lag_distance_unit.
+
+    Optional accumulated damage adds persistent lag while the lag driver remains outside
+    a tolerance around the reference. Damage recovers while the driver is inside it.
     """
     values = np.asarray(response_values, dtype=float)
     lag_steps = max(int(lag_steps), 0)
@@ -412,6 +425,10 @@ def apply_first_order_lag(
         return lagged
 
     alpha = 1.0 / (1.0 + lag_steps)
+    damage_accumulation_rate = max(float(damage_accumulation_rate), 0.0)
+    damage_recovery_rate = max(float(damage_recovery_rate), 0.0)
+    damage_tolerance = max(float(damage_tolerance), 0.0)
+    damage_max_lag = max(float(damage_max_lag), 0.0)
 
     finite_idx = np.flatnonzero(np.isfinite(values))
     if finite_idx.size == 0:
@@ -431,10 +448,22 @@ def apply_first_order_lag(
 
     for start, end in segments:
         lagged[start] = values[start]
+        accumulated_damage = 0.0
         for step in range(start + 1, end + 1):
             if use_distance_weight and np.isfinite(predictor_array[step]):
                 distance = abs(float(predictor_array[step]) - float(lag_reference))
-                dynamic_lag = lag_sensitivity * distance / lag_distance_unit
+                distance_units = distance / lag_distance_unit
+                if damage_accumulation_enabled:
+                    excess_distance = max(distance_units - damage_tolerance, 0.0)
+                    if excess_distance > 0.0:
+                        accumulated_damage += damage_accumulation_rate * excess_distance
+                    else:
+                        accumulated_damage = max(
+                            0.0,
+                            accumulated_damage - damage_recovery_rate,
+                        )
+                    accumulated_damage = min(accumulated_damage, damage_max_lag)
+                dynamic_lag = lag_sensitivity * distance_units + accumulated_damage
                 effective_alpha = 1.0 / (1.0 + dynamic_lag)
             else:
                 effective_alpha = alpha
@@ -1205,6 +1234,11 @@ def reset_all_settings():
         "resilience_lag_mode": "Fixed lag",
         "resilience_lag_sensitivity": 1.0,
         "resilience_lag_driver": "Primary stressor",
+        "resilience_damage_accumulation_enabled": False,
+        "resilience_damage_accumulation_rate": 0.05,
+        "resilience_damage_recovery_rate": 0.10,
+        "resilience_damage_tolerance": 0.5,
+        "resilience_damage_max_lag": 60.0,
         "resilience_2d_mode": False,
         "resilience_2d_mode_initialized": False,
         "resilience_condition_predictor": "T_leaf",
@@ -2606,6 +2640,21 @@ def render_resilience_page():
     lag_driver = st.session_state.get("resilience_lag_driver", "Primary stressor")
     lag_driver_predictor = predictor
     lag_distance_unit = float(LAG_DISTANCE_CONFIG[predictor]["unit_size"])
+    damage_accumulation_enabled = bool(
+        st.session_state.get("resilience_damage_accumulation_enabled", False)
+    )
+    damage_accumulation_rate = float(
+        st.session_state.get("resilience_damage_accumulation_rate", 0.05)
+    )
+    damage_recovery_rate = float(
+        st.session_state.get("resilience_damage_recovery_rate", 0.10)
+    )
+    damage_tolerance = float(
+        st.session_state.get("resilience_damage_tolerance", 0.5)
+    )
+    damage_max_lag = float(
+        st.session_state.get("resilience_damage_max_lag", 60.0)
+    )
     lag_reference = float(
         st.session_state.get(
             lag_reference_key,
@@ -2912,6 +2961,7 @@ When **Stressor drift** is enabled, each trajectory follows:
                     lag_driver = "Primary stressor"
                     lag_driver_predictor = predictor
                     lag_distance_unit = float(LAG_DISTANCE_CONFIG[predictor]["unit_size"])
+                    damage_accumulation_enabled = False
                 else:
                     lag_steps_global = 0
                     if resilience_2d_mode:
@@ -2981,12 +3031,69 @@ When **Stressor drift** is enabled, each trajectory follows:
                     st.caption(
                         "At the reference the response is immediate. Lag increases linearly with absolute distance."
                     )
+                    damage_accumulation_enabled = st.toggle(
+                        "Accumulate stress damage",
+                        value=damage_accumulation_enabled,
+                        key="resilience_damage_accumulation_enabled",
+                        help=(
+                            "Adds persistent lag when the lag driver remains outside the tolerance around "
+                            "its reference. This changes response speed, not the underlying response curve."
+                        ),
+                    )
+                    if damage_accumulation_enabled:
+                        damage_tolerance = st.slider(
+                            "Damage-free distance (reference units)",
+                            min_value=0.0,
+                            max_value=5.0,
+                            value=damage_tolerance,
+                            step=0.1,
+                            key="resilience_damage_tolerance",
+                            help=(
+                                f"No damage accumulates within this many units of the reference. "
+                                f"One unit is {sensitivity_unit_label}."
+                            ),
+                        )
+                        damage_accumulation_rate = st.slider(
+                            "Damage accumulation (lag steps per step and distance unit)",
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=damage_accumulation_rate,
+                            step=0.01,
+                            key="resilience_damage_accumulation_rate",
+                            help=(
+                                "Controls how quickly prolonged exposure outside the damage-free distance "
+                                "adds persistent response lag."
+                            ),
+                        )
+                        damage_recovery_rate = st.slider(
+                            "Damage recovery (lag steps per step)",
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=damage_recovery_rate,
+                            step=0.01,
+                            key="resilience_damage_recovery_rate",
+                            help="Controls how quickly accumulated lag is removed near the reference.",
+                        )
+                        damage_max_lag = st.slider(
+                            "Maximum accumulated lag (steps)",
+                            min_value=0.0,
+                            max_value=120.0,
+                            value=damage_max_lag,
+                            step=1.0,
+                            key="resilience_damage_max_lag",
+                            help="Caps the persistent lag added by accumulated damage.",
+                        )
+                        st.caption(
+                            "Effective lag = distance-based lag + accumulated damage. Damage grows with "
+                            "both exposure duration and distance beyond the tolerance."
+                        )
             else:
                 lag_steps_global = 0
                 lag_mode = "Fixed lag"
                 lag_driver = "Primary stressor"
                 lag_driver_predictor = predictor
                 lag_distance_unit = float(LAG_DISTANCE_CONFIG[predictor]["unit_size"])
+                damage_accumulation_enabled = False
                 lag_reference = float(st.session_state.get("temp_optimum_c", lag_reference_default_base))
 
         with st.expander("Stressor", expanded=False):
@@ -3319,6 +3426,11 @@ When **Stressor drift** is enabled, each trajectory follows:
                     "lag_driver": lag_driver,
                     "lag_driver_predictor": lag_driver_predictor,
                     "lag_distance_unit": lag_distance_unit,
+                    "damage_accumulation_enabled": damage_accumulation_enabled,
+                    "damage_accumulation_rate": damage_accumulation_rate,
+                    "damage_recovery_rate": damage_recovery_rate,
+                    "damage_tolerance": damage_tolerance,
+                    "damage_max_lag": damage_max_lag,
                     "drift_start": trajectory_drift_starts[idx],
                     "drift_end": trajectory_drift_ends[idx],
                 }
@@ -3694,6 +3806,21 @@ When **Stressor drift** is enabled, each trajectory follows:
                         lag_sensitivity=float(trajectory_settings[idx].get("lag_sensitivity", 1.0)),
                         use_distance_weight=dynamic_lag,
                         lag_distance_unit=float(trajectory_settings[idx].get("lag_distance_unit", 1.0)),
+                        damage_accumulation_enabled=bool(
+                            trajectory_settings[idx].get("damage_accumulation_enabled", False)
+                        ),
+                        damage_accumulation_rate=float(
+                            trajectory_settings[idx].get("damage_accumulation_rate", 0.0)
+                        ),
+                        damage_recovery_rate=float(
+                            trajectory_settings[idx].get("damage_recovery_rate", 0.0)
+                        ),
+                        damage_tolerance=float(
+                            trajectory_settings[idx].get("damage_tolerance", 0.0)
+                        ),
+                        damage_max_lag=float(
+                            trajectory_settings[idx].get("damage_max_lag", 60.0)
+                        ),
                     )
             predictor_anoms = trajectory_values - trajectory_means[:, None]
             response_anoms = trajectory_response - baseline_response[:, None]
